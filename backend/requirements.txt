@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+gitpython
+pygithub
+openai
+pandas
+openpyxl
+requests
+python-dotenv
+semgrep
+pip-audit
+fpdf2

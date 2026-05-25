@@ -1,0 +1,38 @@
+# Virtual environments
+.venv/
+venv/
+env/
+path/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment variables (secrets)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+/tmp/
+*.log
+
+# Downloaded fonts for PDF reports
+app/reports/fonts/
+
+# Cloned repos (runtime)
+/repos/
