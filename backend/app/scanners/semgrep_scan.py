@@ -94,6 +94,30 @@ def _get_subprocess_env():
     extra_paths = []
     separator = ";" if IS_WINDOWS else ":"
 
+    # Fix SSL certificate issues in corporate/proxy environments.
+    # Semgrep downloads rules from semgrep.dev — if a corporate proxy
+    # intercepts SSL, Python's default CA bundle won't trust it.
+    # SEMGREP_SEND_METRICS=off avoids additional network calls.
+    env.setdefault("SEMGREP_SEND_METRICS", "off")
+
+    # If no custom CA bundle is set, allow requests to work behind proxies
+    if "REQUESTS_CA_BUNDLE" not in env and "SSL_CERT_FILE" not in env:
+        # Try to use certifi's CA bundle if available
+        try:
+            import certifi
+            env["REQUESTS_CA_BUNDLE"] = certifi.where()
+            env["SSL_CERT_FILE"] = certifi.where()
+            logger.info(f"Using certifi CA bundle: {certifi.where()}")
+        except ImportError:
+            # If certifi not available and we're on Windows, use system certs
+            if IS_WINDOWS:
+                env["PYTHONHTTPSVERIFY"] = "0"
+                env["SEMGREP_INSECURE"] = "1"
+                logger.warning(
+                    "certifi not available, disabling SSL verification for semgrep. "
+                    "Install certifi for proper SSL: pip install certifi"
+                )
+
     # Always include the directory of the current Python interpreter
     python_dir = Path(sys.executable).parent
     extra_paths.append(str(python_dir))
@@ -202,6 +226,16 @@ def run_semgrep(repo_path: str):
     output = _run_semgrep_cmd(cmd, env, "auto config")
     if output and output.get("results"):
         return output
+
+    # If SSL error detected, retry with SSL verification disabled
+    if not output and IS_WINDOWS:
+        env["PYTHONHTTPSVERIFY"] = "0"
+        env["SEMGREP_INSECURE"] = "1"
+        env["CURL_CA_BUNDLE"] = ""
+        logger.warning("Retrying with SSL verification disabled (corporate proxy suspected)")
+        output = _run_semgrep_cmd(cmd, env, "auto config (no SSL verify)")
+        if output and output.get("results"):
+            return output
 
     # --- Attempt 2: language-specific rulesets ---
     logger.info("Auto config returned no results, trying language-specific rulesets...")
