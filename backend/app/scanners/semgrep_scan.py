@@ -94,11 +94,10 @@ def _get_subprocess_env():
     extra_paths = []
     separator = ";" if IS_WINDOWS else ":"
 
-    # Fix SSL certificate issues in corporate/proxy environments.
-    # Semgrep downloads rules from semgrep.dev — if a corporate proxy
-    # intercepts SSL, Python's default CA bundle won't trust it.
-    # SEMGREP_SEND_METRICS=off avoids additional network calls.
-    env.setdefault("SEMGREP_SEND_METRICS", "off")
+    # Semgrep's --config=auto REQUIRES metrics to be enabled.
+    # Do NOT set SEMGREP_SEND_METRICS=off as it breaks auto config.
+    # Instead, we allow metrics (they are anonymous usage stats).
+    env.setdefault("SEMGREP_SEND_METRICS", "on")
 
     # If no custom CA bundle is set, allow requests to work behind proxies
     if "REQUESTS_CA_BUNDLE" not in env and "SSL_CERT_FILE" not in env:
@@ -112,11 +111,14 @@ def _get_subprocess_env():
             # If certifi not available and we're on Windows, use system certs
             if IS_WINDOWS:
                 env["PYTHONHTTPSVERIFY"] = "0"
-                env["SEMGREP_INSECURE"] = "1"
                 logger.warning(
                     "certifi not available, disabling SSL verification for semgrep. "
                     "Install certifi for proper SSL: pip install certifi"
                 )
+
+    # Force UTF-8 encoding for subprocess output (Windows defaults to cp1252
+    # which can't decode semgrep's UTF-8 output)
+    env["PYTHONIOENCODING"] = "utf-8"
 
     # Always include the directory of the current Python interpreter
     python_dir = Path(sys.executable).parent
@@ -173,7 +175,9 @@ def _run_semgrep_cmd(cmd: list, env: dict, description: str = ""):
             capture_output=True,
             text=True,
             timeout=600,
-            env=env
+            env=env,
+            encoding="utf-8",
+            errors="replace"
         )
     except subprocess.TimeoutExpired:
         logger.error(f"Semgrep timed out ({description})")
@@ -227,12 +231,12 @@ def run_semgrep(repo_path: str):
     if output and output.get("results"):
         return output
 
-    # If SSL error detected, retry with SSL verification disabled
-    if not output and IS_WINDOWS:
+    # If auto config failed (SSL or other network issue), retry with SSL disabled
+    if not output:
         env["PYTHONHTTPSVERIFY"] = "0"
-        env["SEMGREP_INSECURE"] = "1"
+        env["REQUESTS_CA_BUNDLE"] = ""
         env["CURL_CA_BUNDLE"] = ""
-        logger.warning("Retrying with SSL verification disabled (corporate proxy suspected)")
+        logger.warning("Retrying auto config with SSL verification disabled")
         output = _run_semgrep_cmd(cmd, env, "auto config (no SSL verify)")
         if output and output.get("results"):
             return output
