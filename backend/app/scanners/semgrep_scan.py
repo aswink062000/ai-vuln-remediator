@@ -3,22 +3,41 @@ import json
 import sys
 import shutil
 import logging
+import platform
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+IS_WINDOWS = platform.system() == "Windows"
 
 
 def _get_semgrep_path():
     """
     Find the semgrep binary. Checks:
-    1. Same venv as the running Python interpreter
+    1. Same venv as the running Python interpreter (handles .exe on Windows)
     2. System PATH
+    3. Common pip install locations on Windows (Scripts folder)
     """
-    # Check in the same venv bin directory as the current Python
+    # Determine the correct binary name for the platform
+    binary_name = "semgrep.exe" if IS_WINDOWS else "semgrep"
+
+    # Check in the same venv bin/Scripts directory as the current Python
     venv_bin = Path(sys.executable).parent
-    semgrep_in_venv = venv_bin / "semgrep"
+    semgrep_in_venv = venv_bin / binary_name
     if semgrep_in_venv.exists():
         return str(semgrep_in_venv)
+
+    # On Windows, also check the Scripts subdirectory
+    if IS_WINDOWS:
+        scripts_dir = venv_bin / "Scripts"
+        semgrep_in_scripts = scripts_dir / binary_name
+        if semgrep_in_scripts.exists():
+            return str(semgrep_in_scripts)
+
+        # Check user site-packages Scripts
+        user_scripts = Path.home() / "AppData" / "Roaming" / "Python" / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts" / binary_name
+        if user_scripts.exists():
+            return str(user_scripts)
 
     # Fall back to system PATH
     semgrep_path = shutil.which("semgrep")
@@ -26,7 +45,10 @@ def _get_semgrep_path():
         return semgrep_path
 
     raise FileNotFoundError(
-        "semgrep not found. Install it with: pip install semgrep"
+        "semgrep not found. Install it with: pip install semgrep\n"
+        "On Windows, ensure the Python Scripts folder is in your PATH.\n"
+        "Typical location: C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\Python3x\\Scripts\\\n"
+        "Or use: python -m pip install semgrep && python -m semgrep"
     )
 
 
