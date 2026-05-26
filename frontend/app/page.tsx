@@ -55,8 +55,13 @@ type LogEntry = {
   timestamp?: string;
 };
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL ||
+  "https://ai-vuln-remediator-production.up.railway.app";
+
+const WS_URL =
+  process.env.NEXT_PUBLIC_WS_URL ||
+  "wss://ai-vuln-remediator-production.up.railway.app";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 export default function Home() {
