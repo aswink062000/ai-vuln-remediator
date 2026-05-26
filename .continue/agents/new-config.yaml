@@ -1,0 +1,22 @@
+# Configuration file for JarvisLabs models
+name: JarvisLabs
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Qwen
+    provider: ollama
+    model: qwen2.5-coder:7b
+    api_base: https://1ecc7f4160021.notebooksn.jarvislabs.net
+    roles:
+      - autocomplete
+      - chat
+      - edit
+      - apply
+
+  - name: DeepSeek
+    provider: ollama
+    model: deepseek-coder-v2:16b
+    api_base: https://1ecc7f4160021.notebooksn.jarvislabs.net
+    roles:
+      - chat

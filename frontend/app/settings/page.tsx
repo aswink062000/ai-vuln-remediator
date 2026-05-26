@@ -25,6 +25,9 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+
 export default function SettingsPage() {
   const [token, setToken] = useState("");
   const [testRepoUrl, setTestRepoUrl] = useState("");
@@ -45,20 +48,26 @@ export default function SettingsPage() {
 
   // LLM provider state
   const [geminiKey, setGeminiKey] = useState("");
+  const [groqKey, setGroqKey] = useState("");
   const [nvidiaKey, setNvidiaKey] = useState("");
   const [openrouterKey, setOpenrouterKey] = useState("");
+  const [huggingfaceKey, setHuggingfaceKey] = useState("");
+  const [defaultModel, setDefaultModel] = useState("");
   const [savingLLM, setSavingLLM] = useState(false);
   const [llmStatus, setLlmStatus] = useState<any>(null);
 
   // Load current token status on mount
   useEffect(() => {
+    if (API_KEY) {
+      axios.defaults.headers.common["X-API-Key"] = API_KEY;
+    }
     fetchTokenStatus();
     fetchLLMStatus();
   }, []);
 
   const fetchTokenStatus = async () => {
     try {
-      const res = await axios.get("http://localhost:8000/settings/token/status");
+      const res = await axios.get(`${API_URL}/settings/token/status`);
       setTokenStatus(res.data);
     } catch {
       setTokenStatus(null);
@@ -67,7 +76,7 @@ export default function SettingsPage() {
 
   const fetchLLMStatus = async () => {
     try {
-      const res = await axios.get("http://localhost:8000/environment");
+      const res = await axios.get(`${API_URL}/environment`);
       setLlmStatus(res.data.llm_providers);
     } catch {
       setLlmStatus(null);
@@ -79,11 +88,13 @@ export default function SettingsPage() {
     setAlert(null);
 
     try {
-      // Save each key that has a value
       const keys: Record<string, string> = {};
       if (geminiKey.trim()) keys["GEMINI_API_KEY"] = geminiKey.trim();
+      if (groqKey.trim()) keys["GROQ_API_KEY"] = groqKey.trim();
       if (nvidiaKey.trim()) keys["NVIDIA_API_KEY"] = nvidiaKey.trim();
       if (openrouterKey.trim()) keys["OPENROUTER_API_KEY"] = openrouterKey.trim();
+      if (huggingfaceKey.trim()) keys["HUGGINGFACE_API_KEY"] = huggingfaceKey.trim();
+      if (defaultModel.trim()) keys["DEFAULT_LLM_PROVIDER"] = defaultModel.trim();
 
       if (Object.keys(keys).length === 0) {
         setAlert({
@@ -95,18 +106,20 @@ export default function SettingsPage() {
         return;
       }
 
-      await axios.post("http://localhost:8000/settings/llm/save", { keys });
+      await axios.post(`${API_URL}/settings/llm/save`, { keys });
 
       setAlert({
         type: "success",
         title: "LLM Keys Saved",
-        message: `Saved ${Object.keys(keys).length} API key(s). Restart the backend for changes to take effect.`,
+        message: `Saved ${Object.keys(keys).length} key(s) securely. Active immediately.`,
       });
 
       // Clear inputs and refresh status
       setGeminiKey("");
+      setGroqKey("");
       setNvidiaKey("");
       setOpenrouterKey("");
+      setHuggingfaceKey("");
       await fetchLLMStatus();
     } catch (error: any) {
       setAlert({
@@ -134,7 +147,7 @@ export default function SettingsPage() {
     setAlert(null);
 
     try {
-      const res = await axios.post("http://localhost:8000/settings/token/test", {
+      const res = await axios.post(`${API_URL}/settings/token/test`, {
         token: token.trim(),
         github_url: testRepoUrl.trim(),
       });
@@ -185,7 +198,7 @@ export default function SettingsPage() {
     setAlert(null);
 
     try {
-      await axios.post("http://localhost:8000/settings/token/save", {
+      await axios.post(`${API_URL}/settings/token/save`, {
         token: token.trim(),
       });
 
@@ -488,8 +501,8 @@ export default function SettingsPage() {
           </div>
 
           <p className="text-sm text-muted-foreground mb-4">
-            Configure fallback LLM providers. If Gemini hits rate limits, the app
-            automatically falls through to NVIDIA → OpenRouter.
+            Configure AI model providers. The app uses a fallback chain — if one provider
+            hits rate limits, it automatically tries the next. Set a default to prioritize your preferred model.
           </p>
 
           {llmStatus && (
@@ -511,10 +524,31 @@ export default function SettingsPage() {
           )}
 
           <div className="space-y-4">
+            {/* Default Model Selector */}
+            <div className="space-y-1 rounded-lg border p-3 bg-muted/30">
+              <Label className="text-xs font-semibold">Default AI Model</Label>
+              <select
+                value={defaultModel}
+                onChange={(e) => setDefaultModel(e.target.value)}
+                className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+              >
+                <option value="">Auto (fallback chain)</option>
+                <option value="gemini">Google Gemini 2.0 Flash</option>
+                <option value="gemini-1.5-flash">Google Gemini 1.5 Flash</option>
+                <option value="groq">Groq (Llama 3.1 8B)</option>
+                <option value="nvidia">NVIDIA NIM (Llama 3.1)</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="huggingface">HuggingFace (Qwen 2.5 Coder)</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Choose which model to try first. Falls through to others if it fails.
+              </p>
+            </div>
+
             {/* Gemini */}
             <div className="space-y-1">
               <Label className="text-xs font-semibold">
-                1. Google Gemini (Primary)
+                1. Google Gemini (Recommended)
               </Label>
               <Input
                 type="password"
@@ -524,9 +558,29 @@ export default function SettingsPage() {
                 className="font-mono text-xs"
               />
               <p className="text-xs text-muted-foreground">
-                Get key at{" "}
+                Free tier: 15 RPM.{" "}
                 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
-                  aistudio.google.com/apikey
+                  Get key →
+                </a>
+              </p>
+            </div>
+
+            {/* Groq */}
+            <div className="space-y-1">
+              <Label className="text-xs font-semibold">
+                2. Groq (Fastest inference)
+              </Label>
+              <Input
+                type="password"
+                value={groqKey}
+                onChange={(e) => setGroqKey(e.target.value)}
+                placeholder="gsk_..."
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                Free: 30 req/min, 14400/day.{" "}
+                <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                  Get key →
                 </a>
               </p>
             </div>
@@ -534,7 +588,7 @@ export default function SettingsPage() {
             {/* NVIDIA */}
             <div className="space-y-1">
               <Label className="text-xs font-semibold">
-                2. NVIDIA NIM (Fallback)
+                3. NVIDIA NIM
               </Label>
               <Input
                 type="password"
@@ -544,9 +598,9 @@ export default function SettingsPage() {
                 className="font-mono text-xs"
               />
               <p className="text-xs text-muted-foreground">
-                Free tier at{" "}
+                Free tier available.{" "}
                 <a href="https://build.nvidia.com/" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
-                  build.nvidia.com
+                  Get key →
                 </a>
               </p>
             </div>
@@ -554,7 +608,7 @@ export default function SettingsPage() {
             {/* OpenRouter */}
             <div className="space-y-1">
               <Label className="text-xs font-semibold">
-                3. OpenRouter (Fallback)
+                4. OpenRouter (Many free models)
               </Label>
               <Input
                 type="password"
@@ -564,9 +618,29 @@ export default function SettingsPage() {
                 className="font-mono text-xs"
               />
               <p className="text-xs text-muted-foreground">
-                Free models at{" "}
+                Free models available.{" "}
                 <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
-                  openrouter.ai/keys
+                  Get key →
+                </a>
+              </p>
+            </div>
+
+            {/* HuggingFace */}
+            <div className="space-y-1">
+              <Label className="text-xs font-semibold">
+                5. HuggingFace (Qwen 2.5 Coder)
+              </Label>
+              <Input
+                type="password"
+                value={huggingfaceKey}
+                onChange={(e) => setHuggingfaceKey(e.target.value)}
+                placeholder="hf_..."
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                Free inference API.{" "}
+                <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                  Get key →
                 </a>
               </p>
             </div>
@@ -614,6 +688,66 @@ export default function SettingsPage() {
               automatically fork it to your account and create a cross-repo Pull Request.
             </p>
           </div>
+        </Card>
+
+        {/* Custom Rules Section */}
+        <Card className="p-5 rounded-2xl">
+          <div className="flex items-center gap-2 mb-4">
+            <Shield className="h-5 w-5 text-orange-600" />
+            <h2 className="text-lg font-semibold">Custom Scan Rules</h2>
+          </div>
+          <p className="text-sm text-muted-foreground mb-4">
+            Create custom Semgrep rules to detect patterns specific to your codebase.
+            Rules run alongside the default security scans.
+          </p>
+          <div className="space-y-3">
+            <div className="rounded-lg bg-muted/50 p-4 space-y-2 text-xs">
+              <p className="font-semibold">Example: Detect hardcoded localhost URLs</p>
+              <pre className="bg-slate-900 text-green-400 p-2 rounded text-[11px] overflow-x-auto">
+{`Pattern: requests.get("http://localhost...")
+Language: python
+Severity: WARNING
+Message: Hardcoded localhost URL found`}</pre>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Manage rules via the API: <code className="bg-muted px-1 rounded">GET /rules</code>, <code className="bg-muted px-1 rounded">POST /rules</code>
+            </p>
+            <a
+              href={`${API_URL}/docs#/Custom%20Rules`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+            >
+              Open Rules API →
+            </a>
+          </div>
+        </Card>
+
+        {/* Scheduled Scans Section */}
+        <Card className="p-5 rounded-2xl">
+          <div className="flex items-center gap-2 mb-4">
+            <Key className="h-5 w-5 text-purple-600" />
+            <h2 className="text-lg font-semibold">Scheduled Scans</h2>
+          </div>
+          <p className="text-sm text-muted-foreground mb-4">
+            Set up recurring scans to monitor repositories over time.
+            Track trends and catch new vulnerabilities as dependencies update.
+          </p>
+          <div className="rounded-lg bg-muted/50 p-4 space-y-2 text-xs">
+            <p><strong>Frequencies:</strong> Daily, Weekly, Monthly</p>
+            <p><strong>Features:</strong> Auto-saves to history, trend tracking, quality gate monitoring</p>
+          </div>
+          <p className="text-xs text-muted-foreground mt-3">
+            Manage via API: <code className="bg-muted px-1 rounded">GET /schedules</code>, <code className="bg-muted px-1 rounded">POST /schedules</code>
+          </p>
+          <a
+            href={`${API_URL}/docs#/API%20v1/list_schedules_api_v1_schedules_get`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline mt-2"
+          >
+            Open Schedules API →
+          </a>
         </Card>
       </div>
     </main>

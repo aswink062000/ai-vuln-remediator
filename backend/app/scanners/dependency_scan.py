@@ -34,11 +34,17 @@ def run_dependency_scan(repo_path: str) -> List[Dict[str, Any]]:
     has_java_maven = (repo / "pom.xml").exists()
     has_java_gradle = (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists()
     has_node = (repo / "package.json").exists()
+    has_dotnet = any(repo.rglob("*.csproj")) or any(repo.rglob("*.fsproj"))
+    has_go = (repo / "go.mod").exists()
+    has_rust = (repo / "Cargo.toml").exists()
+    has_ruby = (repo / "Gemfile.lock").exists()
+    has_php = (repo / "composer.lock").exists()
 
     logger.info(
         f"Project detection - Python: {has_python}, "
         f"Maven: {has_java_maven}, Gradle: {has_java_gradle}, "
-        f"Node: {has_node}"
+        f"Node: {has_node}, .NET: {has_dotnet}, Go: {has_go}, "
+        f"Rust: {has_rust}, Ruby: {has_ruby}, PHP: {has_php}"
     )
 
     # Run applicable scanners
@@ -53,6 +59,21 @@ def run_dependency_scan(repo_path: str) -> List[Dict[str, Any]]:
 
     if has_node:
         findings.extend(scan_node_dependencies(repo_path))
+
+    if has_dotnet:
+        findings.extend(scan_dotnet_dependencies(repo_path))
+
+    if has_go:
+        findings.extend(scan_go_dependencies(repo_path))
+
+    if has_rust:
+        findings.extend(scan_rust_dependencies(repo_path))
+
+    if has_ruby:
+        findings.extend(scan_ruby_dependencies(repo_path))
+
+    if has_php:
+        findings.extend(scan_php_dependencies(repo_path))
 
     logger.info(f"Total dependency vulnerabilities found: {len(findings)}")
     return findings
@@ -102,8 +123,22 @@ def scan_python_dependencies(repo_path: str) -> List[Dict[str, Any]]:
     # Get pip-audit path
     pip_audit_bin = _get_pip_audit_path()
     if not pip_audit_bin:
+        # Auto-install pip-audit
+        logger.info("pip-audit not found, attempting auto-install...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "pip-audit"],
+                capture_output=True,
+                timeout=120
+            )
+            pip_audit_bin = _get_pip_audit_path()
+        except Exception as e:
+            logger.warning(f"Failed to auto-install pip-audit: {e}")
+
+    if not pip_audit_bin:
         logger.warning(
-            "pip-audit not found. Install with: pip install pip-audit"
+            "pip-audit not found and auto-install failed. "
+            "Install with: pip install pip-audit"
         )
         # Fallback to safety-db check
         return _scan_python_fallback(repo_path, req_files)
@@ -122,14 +157,17 @@ def scan_python_dependencies(repo_path: str) -> List[Dict[str, Any]]:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=300,
                 cwd=repo_path
             )
 
-            if result.stdout:
+            stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+
+            if stdout:
                 try:
-                    audit_results = json.loads(result.stdout)
+                    audit_results = json.loads(stdout)
                     # pip-audit returns a list of vulnerability objects
                     if isinstance(audit_results, list):
                         vulns = audit_results
@@ -163,8 +201,8 @@ def scan_python_dependencies(repo_path: str) -> List[Dict[str, Any]]:
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse pip-audit output: {e}")
 
-            if result.stderr:
-                logger.debug(f"pip-audit stderr: {result.stderr[:500]}")
+            if stderr:
+                logger.debug(f"pip-audit stderr: {stderr[:500]}")
 
         except subprocess.TimeoutExpired:
             logger.warning(f"pip-audit timed out for {req_file.name}")
@@ -280,13 +318,13 @@ def _run_owasp_dependency_check(repo_path: str, dc_path: str) -> List[Dict[str, 
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=600,
             cwd=repo_path
         )
 
         if output_file.exists():
-            report = json.loads(output_file.read_text())
+            report = json.loads(output_file.read_text(encoding="utf-8"))
             deps = report.get("dependencies", [])
 
             for dep in deps:
@@ -348,15 +386,50 @@ def _scan_maven_osv(repo_path: str) -> List[Dict[str, Any]]:
         deps_section = root.find(f".//{ns}dependencies")
         if deps_section is None:
             logger.info("No dependencies section found in pom.xml")
-            return findings
+            dependencies = []
+        else:
+            dependencies = deps_section.findall(f"{ns}dependency")
 
-        dependencies = deps_section.findall(f"{ns}dependency")
         logger.info(f"Found {len(dependencies)} Maven dependencies to check")
 
         # Also check dependencyManagement
         dep_mgmt = root.find(f".//{ns}dependencyManagement/{ns}dependencies")
         if dep_mgmt is not None:
             dependencies.extend(dep_mgmt.findall(f"{ns}dependency"))
+
+        # Also check <parent> section (Spring Boot, etc.)
+        parent = root.find(f"{ns}parent")
+        if parent is not None:
+            parent_group = parent.findtext(f"{ns}groupId", "")
+            parent_artifact = parent.findtext(f"{ns}artifactId", "")
+            parent_version = parent.findtext(f"{ns}version", "")
+            if parent_group and parent_artifact and parent_version:
+                # Clean version (remove .RELEASE, .Final, etc.)
+                clean_version = _clean_maven_version(parent_version)
+                logger.info(f"Found parent: {parent_group}:{parent_artifact}@{parent_version}")
+
+                maven_pkg = f"{parent_group}:{parent_artifact}"
+                vulns = _query_osv(maven_pkg, clean_version, "Maven")
+                for vuln in vulns:
+                    findings.append({
+                        "path": "pom.xml",
+                        "line": _find_dep_line_xml(pom_path, parent_artifact),
+                        "end_line": None,
+                        "rule_id": vuln.get("id", "unknown"),
+                        "message": (
+                            f"Vulnerable parent: {maven_pkg}:{parent_version} — "
+                            f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                        ),
+                        "severity": _osv_severity(vuln),
+                        "metadata": {
+                            "scanner": "osv-api",
+                            "category": "dependency",
+                            "package": maven_pkg,
+                            "installed_version": parent_version,
+                            "cve_id": vuln.get("id"),
+                            "aliases": vuln.get("aliases", []),
+                        },
+                    })
 
         # Resolve properties for version placeholders
         properties = {}
@@ -379,9 +452,12 @@ def _scan_maven_osv(repo_path: str) -> List[Dict[str, Any]]:
             if not version or version.startswith("${"):
                 continue  # Can't check without a resolved version
 
+            # Clean version (remove .RELEASE, .Final, -SNAPSHOT, etc.)
+            clean_version = _clean_maven_version(version)
+
             # Query OSV for Maven package
             maven_pkg = f"{group_id}:{artifact_id}"
-            vulns = _query_osv(maven_pkg, version, "Maven")
+            vulns = _query_osv(maven_pkg, clean_version, "Maven")
 
             for vuln in vulns:
                 line = _find_dep_line_xml(pom_path, artifact_id)
@@ -540,14 +616,16 @@ def _run_npm_audit(repo_path: str, npm_path: str) -> List[Dict[str, Any]]:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=120,
             cwd=repo_path
         )
 
-        if result.stdout:
+        stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+
+        if stdout:
             try:
-                audit_data = json.loads(result.stdout)
+                audit_data = json.loads(stdout)
                 vulnerabilities = audit_data.get("vulnerabilities", {})
 
                 for pkg_name, vuln_info in vulnerabilities.items():
@@ -691,6 +769,24 @@ def _find_dep_line(file_path: Path, dep_name: str) -> int:
     return 1
 
 
+def _clean_maven_version(version: str) -> str:
+    """
+    Clean Maven version strings for OSV.dev lookup.
+    Removes suffixes like .RELEASE, .Final, -SNAPSHOT that OSV doesn't understand.
+    Examples:
+        2.2.1.RELEASE → 2.2.1
+        5.6.15.Final → 5.6.15
+        3.0.0-SNAPSHOT → 3.0.0
+        2.7.18 → 2.7.18 (unchanged)
+    """
+    import re
+    # Remove common suffixes
+    cleaned = re.sub(r'[.\-](RELEASE|Final|FINAL|GA|SNAPSHOT|SP\d+|M\d+|RC\d+|CR\d+|Beta\d*|Alpha\d*)$', '', version, flags=re.IGNORECASE)
+    # Remove trailing dots
+    cleaned = cleaned.rstrip(".")
+    return cleaned if cleaned else version
+
+
 def _find_dep_line_xml(file_path: Path, artifact_id: str) -> int:
     """Find the line number of an artifactId in pom.xml."""
     try:
@@ -769,3 +865,369 @@ def _osv_severity(vuln: dict) -> str:
         return "HIGH"
 
     return "MEDIUM"
+
+
+# =============================================================================
+# .NET / NUGET DEPENDENCY SCANNING
+# =============================================================================
+
+def scan_dotnet_dependencies(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan .NET (C#/F#) dependencies for known CVEs.
+    Parses .csproj files and checks against OSV.dev API.
+    """
+    import xml.etree.ElementTree as ET
+
+    findings = []
+    repo = Path(repo_path)
+
+    csproj_files = list(repo.rglob("*.csproj")) + list(repo.rglob("*.fsproj"))
+    logger.info(f"Found {len(csproj_files)} .NET project files")
+
+    for csproj in csproj_files:
+        try:
+            tree = ET.parse(str(csproj))
+            root = tree.getroot()
+
+            # .csproj files may or may not have a namespace
+            ns = ""
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+
+            # Find PackageReference elements
+            packages = root.findall(f".//{ns}PackageReference")
+            if not packages:
+                packages = root.findall(".//PackageReference")
+
+            rel_path = str(csproj.relative_to(repo))
+            logger.info(f"Checking {len(packages)} NuGet packages in {rel_path}")
+
+            for pkg in packages:
+                name = pkg.get("Include", "") or pkg.get("include", "")
+                version = pkg.get("Version", "") or pkg.get("version", "")
+
+                if not name or not version:
+                    continue
+
+                # Query OSV for NuGet package
+                vulns = _query_osv(name, version, "NuGet")
+                for vuln in vulns:
+                    line = _find_dep_line(csproj, name)
+                    findings.append({
+                        "path": rel_path,
+                        "line": line,
+                        "end_line": None,
+                        "rule_id": vuln.get("id", "unknown"),
+                        "message": (
+                            f"Vulnerable NuGet package: {name}@{version} — "
+                            f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                        ),
+                        "severity": _osv_severity(vuln),
+                        "metadata": {
+                            "scanner": "osv-api",
+                            "category": "dependency",
+                            "package": name,
+                            "ecosystem": "NuGet",
+                            "installed_version": version,
+                            "cve_id": vuln.get("id"),
+                            "aliases": vuln.get("aliases", []),
+                        },
+                    })
+
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse {csproj}: {e}")
+        except Exception as e:
+            logger.error(f".NET scan failed for {csproj}: {e}")
+
+    logger.info(f".NET dependency scan found {len(findings)} vulnerabilities")
+    return findings
+
+
+# =============================================================================
+# GO MODULE DEPENDENCY SCANNING
+# =============================================================================
+
+def scan_go_dependencies(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan Go module dependencies for known CVEs.
+    Parses go.mod/go.sum and checks against OSV.dev API.
+    """
+    findings = []
+    repo = Path(repo_path)
+    go_mod = repo / "go.mod"
+
+    if not go_mod.exists():
+        return findings
+
+    try:
+        content = go_mod.read_text(encoding="utf-8", errors="replace")
+        deps = _parse_go_mod(content)
+        logger.info(f"Found {len(deps)} Go dependencies")
+
+        for module, version in deps:
+            # Go versions start with 'v', OSV expects without
+            clean_version = version.lstrip("v")
+            vulns = _query_osv(module, clean_version, "Go")
+
+            for vuln in vulns:
+                line = _find_dep_line(go_mod, module)
+                findings.append({
+                    "path": "go.mod",
+                    "line": line,
+                    "end_line": None,
+                    "rule_id": vuln.get("id", "unknown"),
+                    "message": (
+                        f"Vulnerable Go module: {module}@{version} — "
+                        f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                    ),
+                    "severity": _osv_severity(vuln),
+                    "metadata": {
+                        "scanner": "osv-api",
+                        "category": "dependency",
+                        "package": module,
+                        "ecosystem": "Go",
+                        "installed_version": version,
+                        "cve_id": vuln.get("id"),
+                        "aliases": vuln.get("aliases", []),
+                    },
+                })
+
+    except Exception as e:
+        logger.error(f"Go dependency scan failed: {e}")
+
+    logger.info(f"Go dependency scan found {len(findings)} vulnerabilities")
+    return findings
+
+
+def _parse_go_mod(content: str) -> List[tuple]:
+    """Parse go.mod require block."""
+    import re
+    deps = []
+    in_require = False
+
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("require ("):
+            in_require = True
+            continue
+        if line == ")" and in_require:
+            in_require = False
+            continue
+        if in_require:
+            match = re.match(r'(\S+)\s+(v[\d.]+\S*)', line)
+            if match:
+                deps.append((match.group(1), match.group(2)))
+        elif line.startswith("require "):
+            match = re.match(r'require\s+(\S+)\s+(v[\d.]+\S*)', line)
+            if match:
+                deps.append((match.group(1), match.group(2)))
+
+    return deps
+
+
+# =============================================================================
+# RUST / CARGO DEPENDENCY SCANNING
+# =============================================================================
+
+def scan_rust_dependencies(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan Rust/Cargo dependencies for known CVEs.
+    Parses Cargo.toml and checks against OSV.dev API.
+    """
+    findings = []
+    repo = Path(repo_path)
+    cargo_toml = repo / "Cargo.toml"
+
+    if not cargo_toml.exists():
+        return findings
+
+    try:
+        content = cargo_toml.read_text(encoding="utf-8", errors="replace")
+        deps = _parse_cargo_toml(content)
+        logger.info(f"Found {len(deps)} Rust dependencies")
+
+        for name, version in deps:
+            vulns = _query_osv(name, version, "crates.io")
+            for vuln in vulns:
+                line = _find_dep_line(cargo_toml, name)
+                findings.append({
+                    "path": "Cargo.toml",
+                    "line": line,
+                    "end_line": None,
+                    "rule_id": vuln.get("id", "unknown"),
+                    "message": (
+                        f"Vulnerable crate: {name}@{version} — "
+                        f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                    ),
+                    "severity": _osv_severity(vuln),
+                    "metadata": {
+                        "scanner": "osv-api",
+                        "category": "dependency",
+                        "package": name,
+                        "ecosystem": "crates.io",
+                        "installed_version": version,
+                        "cve_id": vuln.get("id"),
+                    },
+                })
+
+    except Exception as e:
+        logger.error(f"Rust dependency scan failed: {e}")
+
+    logger.info(f"Rust dependency scan found {len(findings)} vulnerabilities")
+    return findings
+
+
+def _parse_cargo_toml(content: str) -> List[tuple]:
+    """Parse Cargo.toml dependencies."""
+    import re
+    deps = []
+    in_deps = False
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if re.match(r'\[(.*dependencies.*)\]', stripped):
+            in_deps = True
+            continue
+        if stripped.startswith("[") and in_deps:
+            in_deps = False
+            continue
+        if in_deps and "=" in stripped:
+            match = re.match(r'(\w[\w-]*)\s*=\s*"([^"]+)"', stripped)
+            if match:
+                deps.append((match.group(1), match.group(2)))
+            else:
+                # version = "x.y.z" format
+                match = re.match(r'(\w[\w-]*)\s*=\s*\{.*version\s*=\s*"([^"]+)"', stripped)
+                if match:
+                    deps.append((match.group(1), match.group(2)))
+
+    return deps
+
+
+# =============================================================================
+# RUBY / BUNDLER DEPENDENCY SCANNING
+# =============================================================================
+
+def scan_ruby_dependencies(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan Ruby/Bundler dependencies for known CVEs.
+    Parses Gemfile.lock and checks against OSV.dev API.
+    """
+    findings = []
+    repo = Path(repo_path)
+    gemfile_lock = repo / "Gemfile.lock"
+
+    if not gemfile_lock.exists():
+        return findings
+
+    try:
+        content = gemfile_lock.read_text(encoding="utf-8", errors="replace")
+        deps = _parse_gemfile_lock(content)
+        logger.info(f"Found {len(deps)} Ruby gems")
+
+        for name, version in deps:
+            vulns = _query_osv(name, version, "RubyGems")
+            for vuln in vulns:
+                findings.append({
+                    "path": "Gemfile.lock",
+                    "line": _find_dep_line(gemfile_lock, name),
+                    "end_line": None,
+                    "rule_id": vuln.get("id", "unknown"),
+                    "message": (
+                        f"Vulnerable gem: {name}@{version} — "
+                        f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                    ),
+                    "severity": _osv_severity(vuln),
+                    "metadata": {
+                        "scanner": "osv-api",
+                        "category": "dependency",
+                        "package": name,
+                        "ecosystem": "RubyGems",
+                        "installed_version": version,
+                        "cve_id": vuln.get("id"),
+                    },
+                })
+
+    except Exception as e:
+        logger.error(f"Ruby dependency scan failed: {e}")
+
+    logger.info(f"Ruby dependency scan found {len(findings)} vulnerabilities")
+    return findings
+
+
+def _parse_gemfile_lock(content: str) -> List[tuple]:
+    """Parse Gemfile.lock for gem versions."""
+    import re
+    deps = []
+    in_specs = False
+
+    for line in content.splitlines():
+        if line.strip() == "specs:":
+            in_specs = True
+            continue
+        if in_specs:
+            if not line.startswith("    "):
+                in_specs = False
+                continue
+            match = re.match(r'\s{4}(\S+)\s+\(([^)]+)\)', line)
+            if match:
+                deps.append((match.group(1), match.group(2)))
+
+    return deps
+
+
+# =============================================================================
+# PHP / COMPOSER DEPENDENCY SCANNING
+# =============================================================================
+
+def scan_php_dependencies(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan PHP/Composer dependencies for known CVEs.
+    Parses composer.lock and checks against OSV.dev API.
+    """
+    findings = []
+    repo = Path(repo_path)
+    composer_lock = repo / "composer.lock"
+
+    if not composer_lock.exists():
+        return findings
+
+    try:
+        data = json.loads(composer_lock.read_text(encoding="utf-8", errors="replace"))
+        packages = data.get("packages", []) + data.get("packages-dev", [])
+        logger.info(f"Found {len(packages)} PHP packages")
+
+        for pkg in packages:
+            name = pkg.get("name", "")
+            version = pkg.get("version", "").lstrip("v")
+
+            if not name or not version:
+                continue
+
+            vulns = _query_osv(name, version, "Packagist")
+            for vuln in vulns:
+                findings.append({
+                    "path": "composer.lock",
+                    "line": None,
+                    "end_line": None,
+                    "rule_id": vuln.get("id", "unknown"),
+                    "message": (
+                        f"Vulnerable PHP package: {name}@{version} — "
+                        f"{vuln.get('id')}: {vuln.get('summary', 'No description')}"
+                    ),
+                    "severity": _osv_severity(vuln),
+                    "metadata": {
+                        "scanner": "osv-api",
+                        "category": "dependency",
+                        "package": name,
+                        "ecosystem": "Packagist",
+                        "installed_version": version,
+                        "cve_id": vuln.get("id"),
+                    },
+                })
+
+    except Exception as e:
+        logger.error(f"PHP dependency scan failed: {e}")
+
+    logger.info(f"PHP dependency scan found {len(findings)} vulnerabilities")
+    return findings

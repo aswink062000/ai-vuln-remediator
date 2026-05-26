@@ -1,0 +1,47 @@
+High Impact, Moderate Effort
+1. Compliance Mapping (OWASP, CWE, PCI-DSS, SOC2) Map each finding to compliance frameworks automatically. Show a "Compliance Dashboard" — which standards you're violating. Enterprise buyers care about this more than raw vulnerability counts.
+
+2. PR Comment Bot Instead of just creating a PR with fixes, add inline review comments on the PR explaining why each change was made. Makes the AI fix reviewable by humans. GitHub API supports this already.
+
+3. Baseline / Suppress Findings Let users mark findings as "accepted risk" or "false positive". Store in SQLite. Next scan only shows new findings. This is the #1 feature teams ask for after first scan (too much noise otherwise).
+
+4. Multi-Repo Dashboard Scan multiple repos at once, show a portfolio view: "Org Health Score". Which repos are worst? Which improved? This is what security managers want — not individual scans.
+
+5. Webhook / CI Integration Add a POST /webhook/github endpoint that triggers scans on push events. Users add it as a GitHub webhook → every push gets auto-scanned. Results posted as PR check status.
+
+Medium Impact, Low Effort
+6. Fix Preview (Before/After) Show the actual code diff in the frontend before creating the PR. Let users approve/reject individual file fixes. You already have the /diff endpoint — just render it with syntax highlighting.
+
+7. Scan Comparison Compare two scan results side-by-side: "What's new? What's fixed? What regressed?" Useful for tracking progress between sprints.
+
+8. Email/Slack Notifications Send a summary when a scheduled scan completes or when new CRITICAL findings appear. Simple SMTP or Slack webhook integration.
+
+9. Ignore Patterns Let users configure paths to exclude from scanning (e.g., vendor/, generated/, migrations/). Store in SQLite. Reduces noise significantly.
+
+10. Remediation Playbooks For dependency vulnerabilities where AI can't auto-fix, generate a step-by-step upgrade guide: "To fix CVE-2024-1234, upgrade django from 3.2.1 to 3.2.25. Run: pip install django==3.2.25. Breaking changes: None."
+
+Differentiators (What competitors don't do well)
+11. AI Explanation Mode For each finding, generate a plain-English explanation: "This SQL injection means an attacker could steal your entire database by typing malicious input into the search box." Non-technical stakeholders can understand the risk.
+
+12. Auto-Fix for Dependencies (not just SAST) Currently AI fixes code vulnerabilities. Extend it to auto-upgrade vulnerable dependencies: bump version in requirements.txt / package.json, run tests, create PR. Most tools just report — yours would fix.
+
+13. License Compliance Scanner Scan dependencies for license issues (GPL in a commercial project, etc.). Parse license fields from package metadata. Flag incompatible licenses. This is a separate selling point.
+
+14. Container/Docker Scanning Parse Dockerfile for security issues (running as root, using latest tag, exposing unnecessary ports). Use regex patterns — no external tool needed.
+
+15. Infrastructure as Code (IaC) Scanning Scan Terraform, CloudFormation, Kubernetes YAML for misconfigurations. Semgrep already has rules for this (p/terraform, p/kubernetes). Just add the configs to your scan pipeline.
+
+Quick Wins (< 1 hour each)
+Dark mode PDF reports — match the app theme
+Scan duration timer — show "Scan completed in 45s"
+Finding count badge on browser tab — (14) AI Vuln Remediator
+Keyboard shortcut — Ctrl+Enter to start scan
+Auto-detect repo URL from clipboard — paste detection
+Share scan link — generate a shareable URL for a history entry
+What I'd prioritize if selling this:
+Compliance Mapping — enterprise buyers need this for audits
+Baseline/Suppress — without it, teams get alert fatigue after first scan
+Multi-Repo Dashboard — security managers buy tools, not individual devs
+Webhook/CI Integration — makes it "always on" instead of manual
+Fix Preview — builds trust in AI fixes before they touch production
+Want me to implement any of these?

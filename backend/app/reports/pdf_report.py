@@ -208,14 +208,147 @@ def generate_pdf_report(scan_data: dict) -> bytes:
             _info_row(pdf, "SAST Issues Fixed", str(sast_fixed))
         if files_fixed:
             _info_row(pdf, "Files Modified", str(len(files_fixed)))
+            total_fixed = sum(ff.get("findings_fixed", 0) for ff in files_fixed)
+            _info_row(pdf, "Total Issues Resolved", str(total_fixed))
+
+        pdf.ln(4)
+
+        # --- Issues Fixed Table ---
+        if files_fixed:
+            pdf._font("B", 9)
+            pdf.set_fill_color(30, 120, 60)
+            pdf.set_text_color(255, 255, 255)
+            pdf.cell(8, 6, " #", fill=True)
+            pdf.cell(82, 6, "  Issue Found", fill=True)
+            pdf.cell(50, 6, "  Status", fill=True)
+            pdf.cell(50, 6, "  File", fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+
+            fix_num = 0
+            for ff in files_fixed:
+                fix_details = ff.get("fix_details", [])
+                path = _sanitize(ff.get("path", ""))
+
+                if fix_details:
+                    for detail in fix_details[:5]:
+                        fix_num += 1
+                        if pdf.get_y() > 260:
+                            pdf.add_page()
+
+                        row_alt = fix_num % 2 == 0
+                        if row_alt:
+                            pdf.set_fill_color(245, 250, 245)
+                        else:
+                            pdf.set_fill_color(255, 255, 255)
+
+                        pdf._font("", 7)
+                        pdf.cell(8, 5, f" {fix_num}", fill=True)
+
+                        # Issue column
+                        issue_text = _sanitize(detail.get("issue", ""))[:60]
+                        pdf.cell(82, 5, f"  {issue_text}", fill=True)
+
+                        # Status column
+                        pdf.set_text_color(20, 120, 50)
+                        pdf._font("B", 7)
+                        pdf.cell(50, 5, "  Fixed by AI Remediator", fill=True)
+                        pdf.set_text_color(0, 0, 0)
+
+                        # File column
+                        pdf._font("", 7)
+                        pdf.cell(50, 5, f"  {path[:30]}", fill=True, new_x="LMARGIN", new_y="NEXT")
+                else:
+                    fix_num += 1
+                    if pdf.get_y() > 260:
+                        pdf.add_page()
+
+                    pdf._font("", 7)
+                    pdf.cell(8, 5, f" {fix_num}")
+                    pdf.cell(82, 5, f"  {ff.get('findings_fixed', 0)} vulnerability(s)")
+                    pdf.set_text_color(20, 120, 50)
+                    pdf._font("B", 7)
+                    pdf.cell(50, 5, "  Fixed by AI Remediator")
+                    pdf.set_text_color(0, 0, 0)
+                    pdf._font("", 7)
+                    pdf.cell(50, 5, f"  {path[:30]}", new_x="LMARGIN", new_y="NEXT")
+
+            pdf.ln(3)
+
+            # Confidence summary
+            confidence_files = [ff for ff in files_fixed if ff.get("confidence", -1) >= 0]
+            if confidence_files:
+                pdf._font("B", 8)
+                pdf.cell(0, 5, "  Fix Confidence:", new_x="LMARGIN", new_y="NEXT")
+                pdf._font("", 8)
+                for ff in confidence_files:
+                    conf = ff.get("confidence", 0)
+                    path = _sanitize(ff.get("path", ""))
+                    status = "HIGH" if conf >= 90 else "MEDIUM" if conf >= 70 else "LOW"
+                    pdf.cell(0, 4, f"    {path}: {conf}% ({status})", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.ln(5)
+
+    # --- Compliance Summary ---
+    compliance = scan_data.get("compliance", {})
+    if compliance:
+        _section_title(pdf, "COMPLIANCE STATUS")
+
+        owasp = compliance.get("owasp_top_10", {})
+        pci = compliance.get("pci_dss", {})
+        overall = compliance.get("overall_compliance_score", 0)
+
+        _info_row(pdf, "Overall Compliance Score", f"{overall}%")
+        if owasp:
+            _info_row(pdf, "OWASP Top 10", f"{owasp.get('compliance_score', 0)}% ({owasp.get('violations', 0)} categories violated)")
+        if pci:
+            _info_row(pdf, "PCI-DSS v4.0", f"{pci.get('compliance_score', 0)}% ({pci.get('violations', 0)} requirements failed)")
+
+        # OWASP details
+        if owasp.get("details"):
             pdf.ln(2)
             pdf._font("B", 8)
-            pdf.cell(0, 5, "  Fixed Files:", new_x="LMARGIN", new_y="NEXT")
-            pdf._font("", 8)
-            for ff in files_fixed:
-                path = _sanitize(ff.get("path", ""))
-                count = ff.get("findings_fixed", 0)
-                pdf.cell(0, 4, f"    - {path} ({count} issue(s) fixed)", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 5, "  OWASP Top 10 Breakdown:", new_x="LMARGIN", new_y="NEXT")
+            pdf._font("", 7)
+            for item in owasp["details"]:
+                if item.get("violations", 0) > 0:
+                    pdf.set_text_color(180, 30, 30)
+                    pdf.cell(0, 4, f"    FAIL  {item['code']}: {_sanitize(item['name'])} ({item['violations']} findings)", new_x="LMARGIN", new_y="NEXT")
+                else:
+                    pdf.set_text_color(20, 120, 50)
+                    pdf.cell(0, 4, f"    PASS  {item['code']}: {_sanitize(item['name'])}", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+
+        pdf.ln(5)
+
+    # --- Code Quality Summary ---
+    code_quality = scan_data.get("code_quality", {})
+    if code_quality and code_quality.get("metrics"):
+        _section_title(pdf, "CODE QUALITY")
+
+        metrics = code_quality["metrics"]
+        complexity = metrics.get("complexity", {})
+        duplication = metrics.get("duplication", {})
+        debt = metrics.get("technical_debt", {})
+        gate = code_quality.get("quality_gate_details", {})
+
+        # Quality Gate
+        gate_passed = gate.get("passed", True)
+        pdf._font("B", 9)
+        if gate_passed:
+            pdf.set_text_color(20, 120, 50)
+            pdf.cell(0, 6, "  Quality Gate: PASSED", new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.set_text_color(180, 30, 30)
+            pdf.cell(0, 6, "  Quality Gate: FAILED", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+        pdf._font("", 8)
+        _info_row(pdf, "Maintainability Rating", complexity.get("maintainability_rating", "N/A"))
+        _info_row(pdf, "Average Complexity", str(complexity.get("average_complexity", 0)))
+        _info_row(pdf, "Duplication", f"{duplication.get('duplication_percentage', 0)}%")
+        _info_row(pdf, "Technical Debt", f"{debt.get('total_hours', 0)} hours (Rating: {debt.get('rating', 'N/A')})")
+        _info_row(pdf, "Code Smells", str(code_quality.get("code_smells", {}).get("total", 0)))
+        _info_row(pdf, "Lines of Code", str(metrics.get("lines_of_code", {}).get("code_lines", 0)))
 
         pdf.ln(5)
 

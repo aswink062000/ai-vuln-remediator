@@ -4,6 +4,7 @@ Unified multi-scanner orchestrator.
 Combines results from:
 1. Semgrep (SAST - source code vulnerabilities)
 2. Dependency Scanner (CVEs in packages/libraries)
+3. Code Quality Scanner (complexity, duplication, smells, tech debt)
 
 Returns a unified findings list with scanner metadata.
 """
@@ -13,6 +14,7 @@ from typing import List, Dict, Any
 
 from app.scanners.semgrep_scan import run_semgrep
 from app.scanners.dependency_scan import run_dependency_scan
+from app.scanners.code_quality import run_code_quality_scan
 from app.parsers.findings import extract_findings, normalize_paths
 
 logger = logging.getLogger(__name__)
@@ -72,10 +74,67 @@ def run_all_scanners(repo_path: str) -> Dict[str, Any]:
         logger.error(f"Dependency scan failed: {e}")
         errors.append(f"Dependency scan error: {str(e)}")
 
-    # 3. Deduplicate findings (same CVE from multiple scanners)
+    # 3. Secret Detection
+    logger.info("=== Running Secret Detection ===")
+    try:
+        from app.ml.secret_detector import run_secret_scan
+        secret_findings = run_secret_scan(repo_path)
+        all_findings.extend(secret_findings)
+        logger.info(f"Secret detection: {len(secret_findings)} findings")
+    except Exception as e:
+        logger.error(f"Secret detection failed: {e}")
+        errors.append(f"Secret detection error: {str(e)}")
+
+    # 4. Custom Rules (if any configured)
+    try:
+        from app.scanners.custom_rules import run_custom_rules
+        custom_findings = run_custom_rules(repo_path)
+        if custom_findings:
+            for f in custom_findings:
+                f.setdefault("metadata", {})
+                f["metadata"]["scanner"] = "custom-rules"
+                f["metadata"]["category"] = "custom"
+            all_findings.extend(custom_findings)
+            logger.info(f"Custom rules: {len(custom_findings)} findings")
+    except Exception as e:
+        logger.debug(f"Custom rules skipped: {e}")
+
+    # 5. Best Practices & Deprecated Dependencies
+    logger.info("=== Running Best Practices scan ===")
+    try:
+        from app.scanners.best_practices import run_best_practices_scan
+        bp_findings = run_best_practices_scan(repo_path)
+        all_findings.extend(bp_findings)
+        logger.info(f"Best practices: {len(bp_findings)} findings")
+    except Exception as e:
+        logger.error(f"Best practices scan failed: {e}")
+        errors.append(f"Best practices scan error: {str(e)}")
+
+    # 6. Deduplicate findings
     all_findings = _deduplicate(all_findings)
 
-    # 4. Sort by severity
+    # 6. ML Severity Prediction (adjust priorities based on context)
+    logger.info("=== Running ML Severity Analysis ===")
+    try:
+        from app.ml.severity_predictor import predict_severity
+        all_findings = predict_severity(all_findings, repo_path)
+        logger.info("Severity prediction applied")
+    except Exception as e:
+        logger.debug(f"Severity prediction skipped: {e}")
+
+    # 7. Code Quality Scan
+    logger.info("=== Running Code Quality scan ===")
+    code_quality = {}
+    try:
+        code_quality = run_code_quality_scan(repo_path)
+        logger.info(
+            f"Code quality: gate={'PASSED' if code_quality.get('quality_gate_details', {}).get('passed') else 'FAILED'}"
+        )
+    except Exception as e:
+        logger.error(f"Code quality scan failed: {e}")
+        errors.append(f"Code quality scan error: {str(e)}")
+
+    # 5. Sort by severity
     severity_order = {"CRITICAL": 0, "HIGH": 1, "ERROR": 1, "MEDIUM": 2, "WARNING": 2, "LOW": 3, "INFO": 4}
     all_findings.sort(key=lambda f: severity_order.get(f.get("severity", "MEDIUM").upper(), 3))
 
@@ -91,6 +150,7 @@ def run_all_scanners(repo_path: str) -> Dict[str, Any]:
         "findings": all_findings,
         "summary": summary,
         "errors": errors,
+        "code_quality": code_quality,
     }
 
 

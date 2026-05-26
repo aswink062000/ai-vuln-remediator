@@ -263,20 +263,49 @@ class LLMRouter:
     """
     Routes LLM requests through multiple providers with automatic fallback.
     Tries each provider in priority order until one succeeds.
+
+    Supports DEFAULT_LLM_PROVIDER env var to set preferred provider.
     """
 
     def __init__(self):
-        self.providers = [
+        self._all_providers = [
             GeminiProvider(),
-            GeminiFlashProvider(),  # Different model = separate quota
+            GeminiFlashProvider(),
             GroqProvider(),
             NvidiaProvider(),
             OpenRouterProvider(),
             HuggingFaceProvider(),
         ]
 
+        # Build provider lookup by name
+        self._provider_map = {p.name: p for p in self._all_providers}
+
+        # Reorder based on DEFAULT_LLM_PROVIDER
+        self.providers = self._build_provider_order()
+
         available = [p.name for p in self.providers if p.is_available()]
         logger.info(f"LLM Router initialized. Available providers: {available}")
+
+        default = os.getenv("DEFAULT_LLM_PROVIDER", "")
+        if default:
+            logger.info(f"Default provider set to: {default}")
+
+    def _build_provider_order(self):
+        """Build provider list with default provider first."""
+        default = os.getenv("DEFAULT_LLM_PROVIDER", "").strip().lower()
+
+        if not default:
+            return list(self._all_providers)
+
+        # Find the default provider and move it to front
+        ordered = []
+        for p in self._all_providers:
+            if p.name == default:
+                ordered.insert(0, p)
+            else:
+                ordered.append(p)
+
+        return ordered
 
     def generate(self, prompt: str, max_retries: int = 2) -> tuple[str, str]:
         """

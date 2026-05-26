@@ -1,3 +1,18 @@
+"""
+Cross-platform Semgrep SAST scanner.
+
+Supports: Windows, macOS, Linux
+Auto-installs: semgrep, certifi, pip-system-certs (Windows)
+
+Handles:
+- Binary discovery across all platforms
+- PATH issues (pysemgrep not found on Windows)
+- SSL/TLS certificate errors (corporate proxies)
+- UTF-8 encoding issues (Windows cp1252 default)
+- Metrics requirement for --config=auto
+- Fallback to language-specific rulesets
+"""
+
 import subprocess
 import json
 import os
@@ -6,6 +21,7 @@ import shutil
 import logging
 import platform
 from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +29,66 @@ PLATFORM = platform.system()  # "Windows", "Darwin", "Linux"
 IS_WINDOWS = PLATFORM == "Windows"
 
 
-def _get_semgrep_path():
+# =============================================================================
+# AUTO-INSTALL
+# =============================================================================
+
+def _pip_install(package: str) -> bool:
+    """
+    Install a Python package using pip.
+    Returns True if installation succeeded.
+    """
+    logger.info(f"Auto-installing: {package}")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", package],
+            capture_output=True,
+            text=False,
+            timeout=120
+        )
+        stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+
+        if result.returncode == 0:
+            logger.info(f"Successfully installed: {package}")
+            return True
+        else:
+            logger.warning(f"Failed to install {package}: {stderr[:500]}")
+            return False
+    except Exception as e:
+        logger.warning(f"Exception installing {package}: {e}")
+        return False
+
+
+def _ensure_dependencies():
+    """
+    Ensure all required dependencies are installed.
+    Auto-installs missing packages.
+    """
+    # Check and install semgrep
+    if not shutil.which("semgrep") and not _find_semgrep_binary():
+        logger.info("semgrep not found, attempting auto-install...")
+        _pip_install("semgrep")
+
+    # Check and install certifi (for SSL certificate handling)
+    try:
+        import certifi  # noqa: F401
+    except ImportError:
+        _pip_install("certifi")
+
+    # On Windows, install pip-system-certs to trust corporate proxy CAs
+    if IS_WINDOWS:
+        try:
+            import pip_system_certs  # noqa: F401
+        except ImportError:
+            logger.info("Installing pip-system-certs for Windows SSL compatibility...")
+            _pip_install("pip-system-certs")
+
+
+def _find_semgrep_binary() -> Optional[str]:
     """
     Find the semgrep binary across Windows, macOS, and Linux.
-    Checks:
-    1. Same venv/env as the running Python interpreter
-    2. Platform-specific common install locations
-    3. System PATH
+    Checks venv, user installs, and common system locations.
     """
     binary_name = "semgrep.exe" if IS_WINDOWS else "semgrep"
 
@@ -29,8 +98,8 @@ def _get_semgrep_path():
     if semgrep_in_env.exists():
         return str(semgrep_in_env)
 
-    # On Windows, also check the Scripts subdirectory
     if IS_WINDOWS:
+        # Windows: check Scripts subdirectory
         scripts_dir = python_dir / "Scripts"
         semgrep_in_scripts = scripts_dir / binary_name
         if semgrep_in_scripts.exists():
@@ -57,75 +126,97 @@ def _get_semgrep_path():
     else:
         # macOS / Linux: check common locations
         common_paths = [
-            Path.home() / ".local" / "bin" / binary_name,       # pip install --user
-            Path("/usr/local/bin") / binary_name,                # system-wide
-            Path("/opt/homebrew/bin") / binary_name,             # macOS Homebrew ARM
-            Path("/usr/local/opt/semgrep/bin") / binary_name,   # macOS Homebrew Intel
+            Path.home() / ".local" / "bin" / binary_name,
+            Path("/usr/local/bin") / binary_name,
+            Path("/opt/homebrew/bin") / binary_name,
+            Path("/usr/local/opt/semgrep/bin") / binary_name,
         ]
         for p in common_paths:
             if p.exists():
                 return str(p)
 
-    # 2. Fall back to system PATH
-    semgrep_path = shutil.which("semgrep")
-    if semgrep_path:
-        return semgrep_path
+    # Fall back to system PATH
+    return shutil.which("semgrep")
+
+
+def _get_semgrep_path() -> str:
+    """
+    Get semgrep binary path. Auto-installs if not found.
+    Raises FileNotFoundError if semgrep cannot be found or installed.
+    """
+    path = _find_semgrep_binary()
+    if path:
+        return path
+
+    # Try auto-install
+    logger.info("semgrep not found, attempting auto-install...")
+    if _pip_install("semgrep"):
+        # Re-check after install
+        path = _find_semgrep_binary()
+        if path:
+            return path
 
     raise FileNotFoundError(
-        "semgrep not found. Install it with: pip install semgrep\n"
+        "semgrep not found and auto-install failed.\n"
+        "Please install manually:\n"
+        "  pip install semgrep\n"
         + (
-            "On Windows, ensure the Python Scripts folder is in your PATH.\n"
-            "Typical: C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\Python3x\\Scripts\\"
+            "On Windows, ensure the Python Scripts folder is in your PATH:\n"
+            "  Typical: C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\Python3x\\Scripts\\"
             if IS_WINDOWS
             else "On macOS/Linux, ensure ~/.local/bin is in your PATH.\n"
-            "Or install via: brew install semgrep (macOS) / pip install semgrep"
+            "  Or install via: brew install semgrep (macOS)"
         )
     )
 
 
-def _get_subprocess_env():
+# =============================================================================
+# ENVIRONMENT SETUP
+# =============================================================================
+
+def _get_subprocess_env() -> dict:
     """
     Build environment for subprocess calls.
-    Ensures companion binaries (like pysemgrep) are discoverable
-    by prepending relevant directories to PATH.
+    Handles:
+    - PATH: ensures pysemgrep and other companion binaries are discoverable
+    - SSL: configures CA bundles for corporate proxy environments
+    - Metrics: enables metrics (required for --config=auto)
+    - Encoding: forces UTF-8 output
     Works on Windows, macOS, and Linux.
     """
     env = os.environ.copy()
     extra_paths = []
     separator = ";" if IS_WINDOWS else ":"
 
+    # --- Metrics ---
     # Semgrep's --config=auto REQUIRES metrics to be enabled.
-    # Do NOT set SEMGREP_SEND_METRICS=off as it breaks auto config.
-    # Instead, we allow metrics (they are anonymous usage stats).
-    env.setdefault("SEMGREP_SEND_METRICS", "on")
+    env["SEMGREP_SEND_METRICS"] = "on"
 
-    # If no custom CA bundle is set, allow requests to work behind proxies
+    # --- SSL/TLS ---
+    # Corporate proxies intercept HTTPS with custom CA certs.
+    # Configure Python/requests to trust them.
     if "REQUESTS_CA_BUNDLE" not in env and "SSL_CERT_FILE" not in env:
-        # Try to use certifi's CA bundle if available
         try:
             import certifi
-            env["REQUESTS_CA_BUNDLE"] = certifi.where()
-            env["SSL_CERT_FILE"] = certifi.where()
-            logger.info(f"Using certifi CA bundle: {certifi.where()}")
+            ca_bundle = certifi.where()
+            env["REQUESTS_CA_BUNDLE"] = ca_bundle
+            env["SSL_CERT_FILE"] = ca_bundle
         except ImportError:
-            # If certifi not available and we're on Windows, use system certs
             if IS_WINDOWS:
+                # On Windows without certifi, disable verification as last resort
                 env["PYTHONHTTPSVERIFY"] = "0"
-                logger.warning(
-                    "certifi not available, disabling SSL verification for semgrep. "
-                    "Install certifi for proper SSL: pip install certifi"
-                )
 
-    # Force UTF-8 encoding for subprocess output (Windows defaults to cp1252
-    # which can't decode semgrep's UTF-8 output)
+    # --- Encoding ---
+    # Force UTF-8 for any Python subprocesses spawned by semgrep
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
-    # Always include the directory of the current Python interpreter
+    # --- PATH ---
+    # Ensure companion binaries (pysemgrep, osemgrep) are discoverable
     python_dir = Path(sys.executable).parent
     extra_paths.append(str(python_dir))
 
     if IS_WINDOWS:
-        # Windows: Scripts folder is where pip puts executables
         extra_paths.append(str(python_dir / "Scripts"))
 
         user_scripts = (
@@ -150,7 +241,6 @@ def _get_subprocess_env():
         if home_local_bin.exists():
             extra_paths.append(str(home_local_bin))
 
-        # macOS Homebrew paths
         if PLATFORM == "Darwin":
             for brew_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
                 if Path(brew_path).exists():
@@ -163,9 +253,14 @@ def _get_subprocess_env():
     return env
 
 
-def _run_semgrep_cmd(cmd: list, env: dict, description: str = ""):
+# =============================================================================
+# COMMAND EXECUTION
+# =============================================================================
+
+def _run_semgrep_cmd(cmd: List[str], env: dict, description: str = "") -> Optional[Dict[str, Any]]:
     """
     Execute a semgrep command and return parsed JSON output or None on failure.
+    Uses raw bytes mode to avoid Windows cp1252 encoding issues.
     """
     logger.info(f"Running semgrep ({description}): {' '.join(cmd)}")
 
@@ -173,52 +268,72 @@ def _run_semgrep_cmd(cmd: list, env: dict, description: str = ""):
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=False,  # Raw bytes — avoids Windows cp1252 UnicodeDecodeError
             timeout=600,
-            env=env,
-            encoding="utf-8",
-            errors="replace"
+            env=env
         )
     except subprocess.TimeoutExpired:
         logger.error(f"Semgrep timed out ({description})")
+        return None
+    except FileNotFoundError as e:
+        logger.error(f"Semgrep binary not found ({description}): {e}")
         return None
     except Exception as e:
         logger.error(f"Failed to execute semgrep ({description}): {e}")
         return None
 
+    # Decode output as UTF-8, replacing any invalid bytes
+    stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+    stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+
     logger.info(f"Semgrep exit code ({description}): {result.returncode}")
 
-    if result.stderr:
-        logger.warning(f"Semgrep stderr ({description}): {result.stderr[:2000]}")
+    if stderr:
+        logger.warning(f"Semgrep stderr ({description}): {stderr[:2000]}")
 
-    if not result.stdout.strip():
+    if not stdout.strip():
         return None
 
     try:
-        output = json.loads(result.stdout)
+        output = json.loads(stdout)
         results = output.get("results", [])
         logger.info(f"Semgrep found {len(results)} findings ({description})")
         return output
     except (json.JSONDecodeError, Exception) as e:
         logger.error(f"Failed to parse semgrep output ({description}): {e}")
-        logger.error(f"Stdout (first 500 chars): {result.stdout[:500]}")
+        logger.error(f"Stdout (first 500 chars): {stdout[:500]}")
         return None
 
 
-def run_semgrep(repo_path: str):
+# =============================================================================
+# MAIN SCAN FUNCTION
+# =============================================================================
+
+def run_semgrep(repo_path: str) -> Dict[str, Any]:
     """
     Run semgrep scan on the given repository path.
-    Uses --config=auto for broad language coverage (Python, Java, JS, etc.)
-    Falls back to specific rulesets if auto config fails.
+
+    Strategy:
+    1. Auto-install dependencies if missing
+    2. Try --config=auto (broadest coverage)
+    3. If SSL fails, retry with SSL verification disabled
+    4. Fallback to language-specific rulesets (p/python, p/java, etc.)
+    5. Fallback to legacy command format (older semgrep versions)
+
     Works on Windows, macOS, and Linux.
     """
+    # Step 0: Ensure all dependencies are available
+    _ensure_dependencies()
+
+    # Step 1: Find semgrep binary
     semgrep_bin = _get_semgrep_path()
     logger.info(f"Using semgrep at: {semgrep_bin}")
-    logger.info(f"Platform: {PLATFORM}")
+    logger.info(f"Platform: {PLATFORM} (Python {sys.version_info.major}.{sys.version_info.minor})")
 
+    # Step 2: Build environment
     env = _get_subprocess_env()
 
-    # --- Attempt 1: --config=auto ---
+    # --- Attempt 1: --config=auto (best coverage) ---
     cmd = [
         semgrep_bin, "scan",
         "--config", "auto",
@@ -231,18 +346,22 @@ def run_semgrep(repo_path: str):
     if output and output.get("results"):
         return output
 
-    # If auto config failed (SSL or other network issue), retry with SSL disabled
-    if not output:
-        env["PYTHONHTTPSVERIFY"] = "0"
-        env["REQUESTS_CA_BUNDLE"] = ""
-        env["CURL_CA_BUNDLE"] = ""
+    # --- Attempt 1b: Retry with SSL disabled (corporate proxy) ---
+    if not output or not output.get("results"):
+        env_no_ssl = env.copy()
+        env_no_ssl["PYTHONHTTPSVERIFY"] = "0"
+        env_no_ssl["REQUESTS_CA_BUNDLE"] = ""
+        env_no_ssl["CURL_CA_BUNDLE"] = ""
+        env_no_ssl["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
         logger.warning("Retrying auto config with SSL verification disabled")
-        output = _run_semgrep_cmd(cmd, env, "auto config (no SSL verify)")
+        output = _run_semgrep_cmd(cmd, env_no_ssl, "auto config (no SSL verify)")
         if output and output.get("results"):
             return output
+        # Use the no-SSL env for subsequent attempts too
+        env = env_no_ssl
 
-    # --- Attempt 2: language-specific rulesets ---
-    logger.info("Auto config returned no results, trying language-specific rulesets...")
+    # --- Attempt 2: Language-specific rulesets ---
+    logger.info("Auto config failed, trying language-specific rulesets...")
 
     fallback_configs = [
         "p/python",
@@ -273,7 +392,7 @@ def run_semgrep(repo_path: str):
     if all_results:
         return {"results": all_results, "errors": []}
 
-    # --- Attempt 3: legacy command format (older semgrep versions) ---
+    # --- Attempt 3: Legacy command format (older semgrep versions) ---
     logger.info("Trying legacy semgrep command format (without 'scan' subcommand)...")
 
     legacy_cmd = [

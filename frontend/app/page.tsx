@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import axios from "axios";
 
 import {
@@ -23,6 +23,10 @@ import {
   Eye,
   Settings,
   FileText,
+  Terminal,
+  Monitor,
+  Package,
+  BarChart3,
 } from "lucide-react";
 
 import { useTheme } from "next-themes";
@@ -43,6 +47,17 @@ import {
 } from "@/components/ui/dialog";
 
 type ScanMode = "scan-fix" | "scan-only";
+type LogEntry = {
+  type: string;
+  message: string;
+  level?: string;
+  data?: any;
+  timestamp?: string;
+};
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 export default function Home() {
   const { theme, setTheme } = useTheme();
@@ -60,8 +75,22 @@ export default function Home() {
   const [showHistory, setShowHistory] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // Terminal / WebSocket state
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [currentPhase, setCurrentPhase] = useState("");
+  const [missingSDKs, setMissingSDKs] = useState<any[]>([]);
+  const [showInstallPrompt, setShowInstallPrompt] = useState(false);
+  const [reportView, setReportView] = useState<"report" | "json">("report");
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
   useEffect(() => {
     setMounted(true);
+    // Set API key header for all axios requests
+    if (API_KEY) {
+      axios.defaults.headers.common["X-API-Key"] = API_KEY;
+    }
   }, []);
 
   useEffect(() => {
@@ -71,6 +100,19 @@ export default function Home() {
     }
   }, []);
 
+  // Auto-scroll terminal
+  useEffect(() => {
+    if (terminalRef.current) {
+      terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+    }
+  }, [logs]);
+
+  const addLog = useCallback((entry: LogEntry) => {
+    const timestamped = { ...entry, timestamp: new Date().toLocaleTimeString() };
+    setLogs((prev) => [...prev, timestamped]);
+  }, []);
+
+  // WebSocket-based scan
   async function runScan() {
     if (!url) {
       setErrorMessage("GitHub Repository URL is required before scanning.");
@@ -82,15 +124,101 @@ export default function Home() {
     setErrorMessage("");
     setShowError(false);
     setResult(null);
+    setLogs([]);
+    setShowTerminal(true);
+    setCurrentPhase("Connecting...");
+    setMissingSDKs([]);
+    setShowInstallPrompt(false);
+
+    const wsUrl = `${WS_URL}/ws/scan`;
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        addLog({ type: "log", message: "Connected to server", level: "info" });
+        ws.send(JSON.stringify({ github_url: url, mode: scanMode }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg: LogEntry = JSON.parse(event.data);
+          addLog(msg);
+
+          switch (msg.type) {
+            case "phase":
+              setCurrentPhase(msg.message);
+              break;
+            case "install":
+              // Installation progress
+              break;
+            case "missing_sdk":
+              if (msg.data?.missing) {
+                setMissingSDKs(msg.data.missing);
+                setShowInstallPrompt(true);
+              }
+              break;
+            case "result":
+              setResult(msg.data);
+              setLoading(false);
+              setCurrentPhase("Complete");
+              // Save to history
+              if (msg.data) {
+                const historyEntry = {
+                  url,
+                  mode: scanMode,
+                  timestamp: new Date().toISOString(),
+                  result: msg.data,
+                };
+                const updated = [historyEntry, ...scanHistory].slice(0, 10);
+                setScanHistory(updated);
+                sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+              }
+              break;
+            case "error":
+              setErrorMessage(msg.message);
+              setShowError(true);
+              break;
+          }
+        } catch (e) {
+          addLog({ type: "log", message: event.data, level: "info" });
+        }
+      };
+
+      ws.onerror = () => {
+        addLog({ type: "error", message: "WebSocket connection failed. Falling back to HTTP..." });
+        ws.close();
+        runScanHTTP();
+      };
+
+      ws.onclose = () => {
+        if (loading) {
+          setLoading(false);
+        }
+      };
+    } catch {
+      // Fallback to HTTP if WebSocket fails
+      runScanHTTP();
+    }
+  }
+
+  // HTTP fallback (original behavior)
+  async function runScanHTTP() {
+    setShowTerminal(true);
+    addLog({ type: "log", message: "Using HTTP fallback mode", level: "info" });
+    setCurrentPhase("Scanning (HTTP mode)...");
 
     const endpoint =
       scanMode === "scan-fix"
-        ? "http://localhost:8000/scan"
-        : "http://localhost:8000/scan-only";
+        ? `${API_URL}/scan`
+        : `${API_URL}/scan-only`;
 
     try {
       const res = await axios.post(endpoint, { github_url: url });
       setResult(res.data);
+      addLog({ type: "phase", message: "Scan complete!" });
+      setCurrentPhase("Complete");
 
       const historyEntry = {
         url,
@@ -98,15 +226,14 @@ export default function Home() {
         timestamp: new Date().toISOString(),
         result: res.data,
       };
-
       const updatedHistory = [historyEntry, ...scanHistory].slice(0, 10);
       setScanHistory(updatedHistory);
       sessionStorage.setItem("scanHistory", JSON.stringify(updatedHistory));
     } catch (error: any) {
-      setErrorMessage(
-        error.response?.data?.detail || error.message || "Failed to scan repository"
-      );
+      const msg = error.response?.data?.detail || error.message || "Failed to scan";
+      setErrorMessage(msg);
       setShowError(true);
+      addLog({ type: "error", message: msg });
     } finally {
       setLoading(false);
     }
@@ -122,9 +249,7 @@ export default function Home() {
 
   const downloadResult = () => {
     if (!result) return;
-    const blob = new Blob([JSON.stringify(result, null, 2)], {
-      type: "application/json",
-    });
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
     const downloadUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = downloadUrl;
@@ -140,7 +265,7 @@ export default function Home() {
     if (!result) return;
     try {
       const res = await axios.post(
-        "http://localhost:8000/report/pdf",
+        `${API_URL}/report/pdf`,
         { scan_data: result },
         { responseType: "blob" }
       );
@@ -159,220 +284,548 @@ export default function Home() {
     }
   };
 
+  const downloadSARIF = async () => {
+    if (!result) return;
+    try {
+      const res = await axios.post(
+        `${API_URL}/export/sarif`,
+        { scan_data: result },
+        { responseType: "blob" }
+      );
+      const blob = new Blob([res.data], { type: "application/json" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      const repoName = url.split("/").pop() || "repository";
+      a.download = `${repoName}-scan.sarif`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error("SARIF export failed:", error);
+    }
+  };
+
+  const downloadCSV = async () => {
+    if (!result) return;
+    try {
+      const res = await axios.post(
+        `${API_URL}/export/csv`,
+        { scan_data: result },
+        { responseType: "blob" }
+      );
+      const blob = new Blob([res.data], { type: "text/csv" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      const repoName = url.split("/").pop() || "repository";
+      a.download = `vulnerability-report-${repoName}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error("CSV export failed:", error);
+    }
+  };
+
   const loadFromHistory = (entry: any) => {
     setUrl(entry.url);
     setScanMode(entry.mode || "scan-only");
     setResult(entry.result);
     setShowHistory(false);
+    setShowTerminal(false);
+  };
+
+  const clearHistory = async () => {
+    // Clear from backend
+    try {
+      await axios.delete(`${API_URL}/history`);
+    } catch {
+      // Backend might not have history yet, that's fine
+    }
+    // Clear local
+    setScanHistory([]);
+    sessionStorage.removeItem("scanHistory");
+    setShowHistory(false);
+  };
+
+  const suppressFinding = async (ruleId: string, path: string) => {
+    try {
+      await axios.post(`${API_URL}/baseline/suppress`, {
+        rule_id: ruleId,
+        path: path || "",
+        reason: "accepted_risk",
+      });
+      // Remove from current results display
+      if (result?.findings) {
+        const updated = {
+          ...result,
+          findings: result.findings.filter((f: any) => !(f.rule_id === ruleId && f.path === path)),
+          suppressed_count: (result.suppressed_count || 0) + 1,
+        };
+        updated.total_findings = updated.findings.length;
+        setResult(updated);
+      }
+    } catch {
+      // silently fail
+    }
   };
 
   const sampleRepos = [
-    {
-      name: "Django Vulnerable App",
-      url: "https://github.com/nVisium/django.nV",
-      type: "Python",
-    },
-    {
-      name: "WebGoat Legacy (Java)",
-      url: "https://github.com/WebGoat/WebGoat-Legacy",
-      type: "Java",
-    },
-    {
-      name: "NodeGoat (Node.js)",
-      url: "https://github.com/OWASP/NodeGoat",
-      type: "JavaScript",
-    },
-    {
-      name: "FastAPI (Clean)",
-      url: "https://github.com/tiangolo/fastapi",
-      type: "Python",
-    },
+    { name: "Django Vulnerable App", url: "https://github.com/nVisium/django.nV", type: "Python" },
+    { name: "WebGoat Legacy (Java)", url: "https://github.com/WebGoat/WebGoat-Legacy", type: "Java" },
+    { name: "NodeGoat (Node.js)", url: "https://github.com/OWASP/NodeGoat", type: "JavaScript" },
+    { name: "FastAPI (Clean)", url: "https://github.com/tiangolo/fastapi", type: "Python" },
   ];
 
-  // Helper to get severity color
   const severityColor = (severity: string) => {
     const s = severity?.toUpperCase();
     if (s === "CRITICAL") return "bg-red-600 text-white";
     if (s === "HIGH" || s === "ERROR") return "bg-orange-600 text-white";
-    if (s === "MEDIUM" || s === "WARNING" || s === "MODERATE")
-      return "bg-yellow-500 text-black";
+    if (s === "MEDIUM" || s === "WARNING" || s === "MODERATE") return "bg-yellow-500 text-black";
     return "bg-blue-500 text-white";
+  };
+
+  const getLogColor = (entry: LogEntry) => {
+    if (entry.type === "error") return "text-red-400";
+    if (entry.type === "phase") return "text-cyan-400 font-semibold";
+    if (entry.type === "install") return "text-yellow-400";
+    if (entry.type === "missing_sdk") return "text-orange-400";
+    if (entry.level === "warning") return "text-yellow-400";
+    if (entry.level === "error") return "text-red-400";
+    return "text-green-400";
+  };
+
+  const getLogPrefix = (entry: LogEntry) => {
+    if (entry.type === "phase") return "▶";
+    if (entry.type === "install") return "📦";
+    if (entry.type === "error") return "✗";
+    if (entry.type === "missing_sdk") return "⚠";
+    if (entry.type === "sdk_check") return "🔍";
+    return "›";
+  };
+
+  const ratingColor = (rating: string) => {
+    switch (rating) {
+      case "A": return "text-green-600";
+      case "B": return "text-blue-600";
+      case "C": return "text-yellow-600";
+      case "D": return "text-orange-600";
+      case "E": case "F": return "text-red-600";
+      default: return "text-muted-foreground";
+    }
   };
 
   // Render findings summary
   const renderSummary = () => {
     if (!result) return null;
-
     const summary = result.scan_summary;
     const findings = result.findings || [];
     const total = result.total_findings ?? findings.length;
 
     return (
       <div className="space-y-4">
-        {/* Status Badge */}
         <div className="flex items-center gap-3">
           {result.status === "clean" ? (
-            <Badge className="bg-green-600 text-white px-3 py-1">
-              <ShieldCheck className="h-3 w-3 mr-1" /> Clean
-            </Badge>
+            <Badge className="bg-green-600 text-white px-3 py-1"><ShieldCheck className="h-3 w-3 mr-1" /> Clean</Badge>
           ) : result.status === "success" ? (
-            <Badge className="bg-blue-600 text-white px-3 py-1">
-              <Wrench className="h-3 w-3 mr-1" /> Fix Applied
-            </Badge>
-          ) : result.status === "error" || result.status === "scan_failed" ? (
-            <Badge className="bg-red-600 text-white px-3 py-1">
-              <XCircle className="h-3 w-3 mr-1" /> Error
-            </Badge>
+            <Badge className="bg-blue-600 text-white px-3 py-1"><Wrench className="h-3 w-3 mr-1" /> Fix Applied</Badge>
+          ) : result.status === "error" ? (
+            <Badge className="bg-red-600 text-white px-3 py-1"><XCircle className="h-3 w-3 mr-1" /> Error</Badge>
           ) : (
-            <Badge className="bg-orange-600 text-white px-3 py-1">
-              <ShieldAlert className="h-3 w-3 mr-1" /> Vulnerabilities Found
-            </Badge>
+            <Badge className="bg-orange-600 text-white px-3 py-1"><ShieldAlert className="h-3 w-3 mr-1" /> Vulnerabilities Found</Badge>
           )}
-          <span className="text-sm text-muted-foreground">
-            {total} total finding{total !== 1 ? "s" : ""}
-          </span>
+          <span className="text-sm text-muted-foreground">{total} finding{total !== 1 ? "s" : ""}</span>
         </div>
 
-        {/* Summary Stats */}
         {summary && (
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            {Object.entries(summary.by_severity || {}).map(
-              ([sev, count]) => (
-                <div
-                  key={sev}
-                  className="rounded-lg border p-3 text-center"
-                >
-                  <Badge className={`${severityColor(sev)} text-xs`}>
-                    {sev}
-                  </Badge>
-                  <p className="text-2xl font-bold mt-1">
-                    {count as number}
-                  </p>
-                </div>
-              )
-            )}
+            {Object.entries(summary.by_severity || {}).map(([sev, count]) => (
+              <div key={sev} className="rounded-lg border p-3 text-center">
+                <Badge className={`${severityColor(sev)} text-xs`}>{sev}</Badge>
+                <p className="text-2xl font-bold mt-1">{count as number}</p>
+              </div>
+            ))}
           </div>
         )}
 
-        {/* Scanner breakdown */}
         {summary?.by_scanner && (
           <div className="rounded-lg border p-3">
-            <p className="text-xs font-semibold text-muted-foreground mb-2">
-              Scanner Breakdown
-            </p>
+            <p className="text-xs font-semibold text-muted-foreground mb-2">Scanner Breakdown</p>
             <div className="flex flex-wrap gap-2">
-              {Object.entries(summary.by_scanner).map(
-                ([scanner, count]) => (
-                  <Badge key={scanner} variant="outline" className="text-xs">
-                    {scanner}: {count as number}
-                  </Badge>
-                )
-              )}
+              {Object.entries(summary.by_scanner).map(([scanner, count]) => (
+                <Badge key={scanner} variant="outline" className="text-xs">{scanner}: {count as number}</Badge>
+              ))}
             </div>
           </div>
         )}
 
-        {/* Project Info & SDK Status */}
         {result.project_info && (
           <div className="rounded-lg border p-3 space-y-2">
-            <p className="text-xs font-semibold text-muted-foreground">
-              Project Detection
-            </p>
+            <p className="text-xs font-semibold text-muted-foreground">Project Detection</p>
             <div className="flex flex-wrap gap-2">
               {result.project_info.languages?.map((lang: string) => (
-                <Badge key={lang} className="bg-violet-600 text-white text-xs">
-                  {lang}
-                </Badge>
+                <Badge key={lang} className="bg-violet-600 text-white text-xs">{lang}</Badge>
               ))}
               {result.project_info.frameworks?.map((fw: string) => (
-                <Badge key={fw} variant="outline" className="text-xs">
-                  {fw}
-                </Badge>
+                <Badge key={fw} variant="outline" className="text-xs">{fw}</Badge>
               ))}
             </div>
-            {result.sdk_status && (
-              <div className="mt-2 space-y-1">
-                <p className="text-xs text-muted-foreground">SDK Status:</p>
-                <div className="flex flex-wrap gap-2">
-                  {Object.entries(result.sdk_status.sdks || {}).map(
-                    ([sdk, info]: [string, any]) => (
-                      <Badge
-                        key={sdk}
-                        variant="outline"
-                        className={`text-xs ${
-                          info.installed
-                            ? "border-green-500 text-green-700 dark:text-green-400"
-                            : "border-red-500 text-red-700 dark:text-red-400"
-                        }`}
-                      >
-                        {info.installed ? "✓" : "✗"} {sdk}
-                      </Badge>
-                    )
+          </div>
+        )}
+
+        {/* Code Quality Dashboard */}
+        {result.code_quality?.metrics && (
+          <div className="space-y-3">
+            {/* Quality Gate Banner */}
+            <div className={`rounded-lg p-4 border ${
+              result.code_quality.quality_gate_details?.passed
+                ? "bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800"
+                : "bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800"
+            }`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  {result.code_quality.quality_gate_details?.passed ? (
+                    <CheckCircle2 className="h-5 w-5 text-green-600" />
+                  ) : (
+                    <XCircle className="h-5 w-5 text-red-600" />
                   )}
+                  <div>
+                    <p className="font-semibold text-sm">Quality Gate</p>
+                    <p className="text-xs text-muted-foreground">
+                      {result.code_quality.quality_gate_details?.passed ? "All conditions met" : "Some conditions failed"}
+                    </p>
+                  </div>
                 </div>
-                {result.sdk_status.missing?.length > 0 && (
-                  <p className="text-xs text-orange-600 dark:text-orange-400 mt-1">
-                    ⚠ Missing: {result.sdk_status.missing.join(", ")} — validation skipped for these
-                  </p>
-                )}
+                <Badge className={`text-sm px-3 py-1 ${
+                  result.code_quality.quality_gate_details?.passed
+                    ? "bg-green-600 text-white"
+                    : "bg-red-600 text-white"
+                }`}>
+                  {result.code_quality.quality_gate_details?.passed ? "PASSED" : "FAILED"}
+                </Badge>
+              </div>
+
+              {/* Gate Conditions */}
+              {result.code_quality.quality_gate_details?.conditions && (
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {result.code_quality.quality_gate_details.conditions.map((cond: any, idx: number) => (
+                    <div key={idx} className="flex items-center gap-2 text-xs">
+                      <span className={cond.status === "PASSED" ? "text-green-600" : cond.status === "WARNING" ? "text-yellow-600" : "text-red-600"}>
+                        {cond.status === "PASSED" ? "✓" : cond.status === "WARNING" ? "⚠" : "✗"}
+                      </span>
+                      <span className="text-muted-foreground">{cond.metric.replace(/_/g, " ")}</span>
+                      <span className="font-mono">{typeof cond.actual === "number" ? cond.actual.toFixed(1) : cond.actual}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Metrics Grid */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              {/* Maintainability */}
+              <div className="rounded-lg border p-3 text-center">
+                <p className="text-xs text-muted-foreground mb-1">Maintainability</p>
+                <p className={`text-2xl font-bold ${ratingColor(result.code_quality.metrics.complexity?.maintainability_rating)}`}>
+                  {result.code_quality.metrics.complexity?.maintainability_rating || "—"}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Index: {result.code_quality.metrics.complexity?.maintainability_index?.toFixed(0)}
+                </p>
+              </div>
+
+              {/* Duplication */}
+              <div className="rounded-lg border p-3 text-center">
+                <p className="text-xs text-muted-foreground mb-1">Duplication</p>
+                <p className={`text-2xl font-bold ${ratingColor(result.code_quality.metrics.duplication?.rating)}`}>
+                  {result.code_quality.metrics.duplication?.rating || "—"}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {result.code_quality.metrics.duplication?.duplication_percentage?.toFixed(1)}%
+                </p>
+              </div>
+
+              {/* Technical Debt */}
+              <div className="rounded-lg border p-3 text-center">
+                <p className="text-xs text-muted-foreground mb-1">Tech Debt</p>
+                <p className={`text-2xl font-bold ${ratingColor(result.code_quality.metrics.technical_debt?.rating)}`}>
+                  {result.code_quality.metrics.technical_debt?.rating || "—"}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {result.code_quality.metrics.technical_debt?.total_hours?.toFixed(1)}h
+                </p>
+              </div>
+
+              {/* Code Smells */}
+              <div className="rounded-lg border p-3 text-center">
+                <p className="text-xs text-muted-foreground mb-1">Code Smells</p>
+                <p className="text-2xl font-bold text-orange-600">
+                  {result.code_quality.code_smells?.total || 0}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  issues found
+                </p>
+              </div>
+            </div>
+
+            {/* LOC & Complexity Summary */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-lg border p-3">
+                <p className="text-xs font-semibold text-muted-foreground mb-2">Lines of Code</p>
+                <div className="space-y-1 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Code</span>
+                    <span className="font-mono">{result.code_quality.metrics.lines_of_code?.code_lines?.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Comments</span>
+                    <span className="font-mono">{result.code_quality.metrics.lines_of_code?.comment_lines?.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Comment %</span>
+                    <span className="font-mono">{result.code_quality.metrics.lines_of_code?.comment_ratio}%</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-lg border p-3">
+                <p className="text-xs font-semibold text-muted-foreground mb-2">Complexity</p>
+                <div className="space-y-1 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Average</span>
+                    <span className="font-mono">{result.code_quality.metrics.complexity?.average_complexity?.toFixed(1)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Max</span>
+                    <span className="font-mono">{result.code_quality.metrics.complexity?.max_complexity}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Complex files</span>
+                    <span className="font-mono">{result.code_quality.metrics.complexity?.files_above_threshold}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Languages Breakdown */}
+            {result.code_quality.metrics.lines_of_code?.languages && Object.keys(result.code_quality.metrics.lines_of_code.languages).length > 0 && (
+              <div className="rounded-lg border p-3">
+                <p className="text-xs font-semibold text-muted-foreground mb-2">Language Distribution</p>
+                <div className="space-y-2">
+                  {Object.entries(result.code_quality.metrics.lines_of_code.languages)
+                    .sort(([, a]: any, [, b]: any) => b - a)
+                    .map(([lang, lines]: [string, any]) => {
+                      const total = result.code_quality.metrics.lines_of_code.code_lines || 1;
+                      const pct = ((lines / total) * 100).toFixed(1);
+                      return (
+                        <div key={lang} className="space-y-1">
+                          <div className="flex justify-between text-xs">
+                            <span>{lang}</span>
+                            <span className="text-muted-foreground">{lines.toLocaleString()} lines ({pct}%)</span>
+                          </div>
+                          <div className="h-1.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-violet-500 rounded-full"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+
+            {/* Top Code Smells */}
+            {result.code_quality.code_smells?.items?.length > 0 && (
+              <div className="rounded-lg border p-3">
+                <p className="text-xs font-semibold text-muted-foreground mb-2">
+                  Code Smells ({result.code_quality.code_smells.total})
+                </p>
+                <div className="max-h-48 overflow-y-auto space-y-2">
+                  {result.code_quality.code_smells.items.slice(0, 10).map((smell: any, idx: number) => (
+                    <div key={idx} className="flex items-start gap-2 text-xs">
+                      <Badge className={`text-[10px] px-1.5 ${
+                        smell.severity === "MAJOR" ? "bg-orange-500 text-white" :
+                        smell.severity === "CRITICAL" ? "bg-red-600 text-white" :
+                        "bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300"
+                      }`}>
+                        {smell.severity}
+                      </Badge>
+                      <div className="flex-1 min-w-0">
+                        <p className="truncate text-muted-foreground">{smell.path}</p>
+                        <p className="text-foreground">{smell.message}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
         )}
 
-        {/* PR Link if scan-fix */}
         {result.pull_request && (
           <div className="rounded-lg bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 p-4">
             <div className="flex items-center gap-2">
               <CheckCircle2 className="h-5 w-5 text-green-600" />
               <div>
                 <p className="font-semibold text-sm">Pull Request Created</p>
-                <a
-                  href={result.pull_request}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-blue-600 hover:underline flex items-center gap-1"
-                >
-                  {result.pull_request}
-                  <ExternalLink className="h-3 w-3" />
+                <a href={result.pull_request} target="_blank" rel="noopener noreferrer"
+                  className="text-xs text-blue-600 hover:underline flex items-center gap-1">
+                  {result.pull_request}<ExternalLink className="h-3 w-3" />
                 </a>
               </div>
+            </div>
+            {/* Fix Confidence */}
+            {result.files_fixed && result.files_fixed.some((f: any) => f.confidence >= 0) && (
+              <div className="mt-3 pt-3 border-t border-green-200 dark:border-green-800">
+                <p className="text-xs font-semibold text-muted-foreground mb-2">Fix Confidence</p>
+                <div className="space-y-1">
+                  {result.files_fixed.filter((f: any) => f.confidence >= 0).map((f: any, idx: number) => (
+                    <div key={idx} className="flex items-center gap-2 text-xs">
+                      <div className="flex-1 min-w-0">
+                        <span className="truncate text-muted-foreground">{f.path}</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <div className="w-16 h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full ${
+                              f.confidence >= 90 ? "bg-green-500" :
+                              f.confidence >= 70 ? "bg-blue-500" :
+                              f.confidence >= 50 ? "bg-yellow-500" : "bg-red-500"
+                            }`}
+                            style={{ width: `${Math.max(f.confidence, 5)}%` }}
+                          />
+                        </div>
+                        <span className={`font-mono ${
+                          f.confidence >= 90 ? "text-green-600" :
+                          f.confidence >= 70 ? "text-blue-600" :
+                          f.confidence >= 50 ? "text-yellow-600" : "text-red-600"
+                        }`}>
+                          {f.confidence}%
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {findings.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-muted-foreground">Top Findings</p>
+            <div className="max-h-80 overflow-y-auto space-y-2">
+              {findings.slice(0, 20).map((f: any, idx: number) => (
+                <div key={idx} className="rounded-lg border p-3 text-sm space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Badge className={`${severityColor(f.adjusted_severity || f.severity)} text-xs`}>
+                      {f.adjusted_severity || f.severity}
+                    </Badge>
+                    {f.risk_score !== undefined && (
+                      <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                        f.risk_score >= 80 ? "bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300" :
+                        f.risk_score >= 60 ? "bg-orange-100 dark:bg-orange-950 text-orange-700 dark:text-orange-300" :
+                        "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400"
+                      }`}>
+                        Risk: {f.risk_score}
+                      </span>
+                    )}
+                    <span className="font-mono text-xs text-muted-foreground">{f.rule_id}</span>
+                    {f.metadata?.category && (
+                      <Badge variant="outline" className={`text-xs ${
+                        f.metadata.category === "secret" ? "border-red-500 text-red-600 dark:text-red-400" : ""
+                      }`}>
+                        {f.metadata.category === "secret" ? "🔑 " : ""}{f.metadata.category}
+                      </Badge>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">{f.path}{f.line ? `:${f.line}` : ""}</p>
+                  <p className="text-xs">{f.message?.slice(0, 200)}</p>
+                  {f.risk_factors && f.risk_factors.length > 0 && f.risk_factors[0] !== "Standard risk level" && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {f.risk_factors.map((factor: string, fi: number) => (
+                        <span key={fi} className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                          {factor}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         )}
 
-        {/* Findings List */}
-        {findings.length > 0 && (
-          <div className="space-y-2">
-            <p className="text-xs font-semibold text-muted-foreground">
-              Top Findings
+        {/* Secrets Summary (if any found) */}
+        {findings.filter((f: any) => f.metadata?.category === "secret").length > 0 && (
+          <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/20 p-3 space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-sm">🔑</span>
+              <p className="text-xs font-semibold text-red-700 dark:text-red-300">
+                Secrets Detected ({findings.filter((f: any) => f.metadata?.category === "secret").length})
+              </p>
+            </div>
+            <div className="space-y-1 max-h-32 overflow-y-auto">
+              {findings.filter((f: any) => f.metadata?.category === "secret").slice(0, 5).map((f: any, idx: number) => (
+                <div key={idx} className="text-xs flex items-center gap-2">
+                  <Badge className="bg-red-600 text-white text-[10px]">SECRET</Badge>
+                  <span className="text-muted-foreground truncate">{f.path}:{f.line}</span>
+                  <span className="truncate">{f.metadata?.secret_type}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Diff Summary (for scan-fix results) */}
+        {result.files_fixed && result.files_fixed.length > 0 && (
+          <div className="rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/20 p-3 space-y-3">
+            <p className="text-xs font-semibold text-green-700 dark:text-green-300">
+              ✅ Issues Fixed by AI Vulnerability Remediator
             </p>
-            <div className="max-h-80 overflow-y-auto space-y-2">
-              {findings.slice(0, 20).map((f: any, idx: number) => (
-                <div
-                  key={idx}
-                  className="rounded-lg border p-3 text-sm space-y-1"
-                >
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Badge
-                      className={`${severityColor(f.severity)} text-xs`}
-                    >
-                      {f.severity}
-                    </Badge>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      {f.rule_id}
-                    </span>
-                    {f.metadata?.category && (
-                      <Badge variant="outline" className="text-xs">
-                        {f.metadata.category}
+
+            {/* Fix details list */}
+            {result.files_fixed.some((f: any) => f.fix_details?.length > 0) && (
+              <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                {result.files_fixed.flatMap((f: any) =>
+                  (f.fix_details || []).map((detail: any, dIdx: number) => (
+                    <div key={`${f.path}-${dIdx}`} className="flex items-start gap-2 text-xs">
+                      <span className="text-green-600 flex-shrink-0 mt-0.5">✓</span>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-foreground truncate">{detail.issue}</p>
+                        <p className="text-green-600 text-[10px]">Fixed in {f.path}</p>
+                      </div>
+                    </div>
+                  ))
+                ).slice(0, 15)}
+              </div>
+            )}
+
+            {/* File summary with confidence */}
+            <div className="space-y-1.5 pt-2 border-t border-green-200 dark:border-green-800">
+              {result.files_fixed.map((f: any, idx: number) => (
+                <div key={idx} className="flex items-center justify-between text-xs">
+                  <span className="font-mono text-muted-foreground truncate">{f.path}</span>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <span className="text-muted-foreground">{f.findings_fixed} fixed</span>
+                    {f.confidence >= 0 && (
+                      <Badge className={`text-[10px] px-1.5 ${
+                        f.confidence >= 90 ? "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-300" :
+                        f.confidence >= 70 ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300" :
+                        "bg-yellow-100 text-yellow-700 dark:bg-yellow-950 dark:text-yellow-300"
+                      }`}>
+                        {f.confidence}%
                       </Badge>
                     )}
+                    {f.diff && (
+                      <span className="text-[10px] text-muted-foreground">+{f.diff.additions} -{f.diff.deletions}</span>
+                    )}
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {f.path}
-                    {f.line ? `:${f.line}` : ""}
-                  </p>
-                  <p className="text-xs">{f.message?.slice(0, 200)}</p>
                 </div>
               ))}
             </div>
@@ -389,48 +842,26 @@ export default function Home() {
         <aside className="w-full lg:w-72 bg-slate-900 text-white border-b lg:border-r lg:border-b-0 flex flex-col">
           <div className="flex items-center justify-between p-3 lg:p-5 border-b border-slate-800">
             <div>
-              <h1 className="font-bold text-lg lg:text-xl leading-tight">
-                Enterprise
-              </h1>
-              <p className="text-xs lg:text-sm text-slate-300">
-                AI Security Platform
-              </p>
+              <h1 className="font-bold text-lg lg:text-xl leading-tight">Enterprise</h1>
+              <p className="text-xs lg:text-sm text-slate-300">AI Security Platform</p>
             </div>
-            <Button
-              size="icon"
-              variant="ghost"
-              className="text-white hover:bg-slate-800"
-              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            >
-              {mounted ? (
-                theme === "dark" ? (
-                  <Sun className="h-5 w-5" />
-                ) : (
-                  <Moon className="h-5 w-5" />
-                )
-              ) : (
-                <div className="h-5 w-5" />
-              )}
+            <Button size="icon" variant="ghost" className="text-white hover:bg-slate-800"
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+              {mounted ? (theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />) : <div className="h-5 w-5" />}
             </Button>
           </div>
 
           <div className="p-2 lg:p-3 space-y-2 lg:space-y-3 overflow-y-auto">
             <div className="flex items-center gap-2 lg:gap-3 rounded-xl bg-slate-800 px-3 lg:px-4 py-3 lg:py-4">
               <SearchCode className="h-4 w-4 lg:h-5 lg:w-5 text-blue-400" />
-              <span className="font-medium text-sm lg:text-base">
-                Repository Scanner
-              </span>
+              <span className="font-medium text-sm lg:text-base">Repository Scanner</span>
             </div>
 
             {scanHistory.length > 0 && (
-              <button
-                onClick={() => setShowHistory(!showHistory)}
-                className="w-full flex items-center gap-2 lg:gap-3 rounded-xl bg-slate-800/50 hover:bg-slate-800 px-3 lg:px-4 py-2 lg:py-3 transition-colors"
-              >
+              <button onClick={() => setShowHistory(!showHistory)}
+                className="w-full flex items-center gap-2 lg:gap-3 rounded-xl bg-slate-800/50 hover:bg-slate-800 px-3 lg:px-4 py-2 lg:py-3 transition-colors">
                 <History className="h-4 w-4 lg:h-5 lg:w-5" />
-                <span className="font-medium text-sm lg:text-base">
-                  Scan History ({scanHistory.length})
-                </span>
+                <span className="font-medium text-sm lg:text-base">Scan History ({scanHistory.length})</span>
               </button>
             )}
 
@@ -438,44 +869,79 @@ export default function Home() {
               <div className="rounded-xl bg-slate-950/60 p-2 lg:p-3 border border-slate-800 max-h-48 lg:max-h-64 overflow-y-auto">
                 <div className="space-y-2">
                   {scanHistory.map((entry, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => loadFromHistory(entry)}
-                      className="w-full text-left p-2 lg:p-3 rounded-lg bg-slate-900/50 hover:bg-slate-800 transition-colors"
-                    >
+                    <button key={idx} onClick={() => loadFromHistory(entry)}
+                      className="w-full text-left p-2 lg:p-3 rounded-lg bg-slate-900/50 hover:bg-slate-800 transition-colors">
                       <div className="flex items-center gap-2">
-                        <Badge
-                          variant="outline"
-                          className="text-[10px] border-slate-600"
-                        >
+                        <Badge variant="outline" className="text-[10px] border-slate-600">
                           {entry.mode === "scan-fix" ? "Fix" : "Scan"}
                         </Badge>
                         <span className="text-xs lg:text-sm font-medium truncate">
                           {entry.url.split("/").slice(-2).join("/")}
                         </span>
                       </div>
-                      <div className="text-xs text-slate-400 mt-1">
-                        {new Date(entry.timestamp).toLocaleString()}
-                      </div>
+                      <div className="text-xs text-slate-400 mt-1">{new Date(entry.timestamp).toLocaleString()}</div>
                     </button>
                   ))}
                 </div>
+                {scanHistory.length > 0 && (
+                  <button
+                    onClick={clearHistory}
+                    className="w-full mt-2 flex items-center justify-center gap-1 rounded-lg bg-red-900/30 hover:bg-red-900/50 border border-red-800/50 px-3 py-2 text-xs text-red-300 transition-colors"
+                  >
+                    <XCircle className="h-3 w-3" />
+                    Clear All History
+                  </button>
+                )}
               </div>
             )}
 
             <div className="rounded-xl bg-slate-950/40 p-3 lg:p-4 border border-slate-800">
               <div className="flex items-center gap-2 mb-2 lg:mb-3">
                 <BrainCircuit className="h-4 w-4 lg:h-5 lg:w-5 text-cyan-400" />
-                <h3 className="font-semibold text-sm lg:text-base">
-                  AI Remediation Engine
-                </h3>
+                <h3 className="font-semibold text-sm lg:text-base">AI Remediation Engine</h3>
               </div>
               <div className="space-y-1 lg:space-y-2 text-xs lg:text-sm text-slate-300">
-                <p>✔ Static Code Analysis</p>
-                <p>✔ Dependency Scanning</p>
-                <p>✔ Secret Detection</p>
-                <p>✔ Contextual AI Fixes</p>
+                <p>✔ SAST Scanning (Semgrep)</p>
+                <p>✔ Dependency CVE Detection</p>
+                <p>✔ Secret & Credential Detection</p>
+                <p>✔ Code Quality & Tech Debt</p>
+                <p>✔ ML Severity Prediction</p>
+                <p>✔ AI-Powered Auto-Fix</p>
+                <p>✔ Fix Confidence Scoring</p>
+                <p>✔ Custom Rule Engine</p>
+                <p>✔ SARIF / CSV / PDF Export</p>
                 <p>✔ Auto-PR Generation</p>
+              </div>
+
+              {/* Supported Languages */}
+              <div className="mt-3 pt-3 border-t border-slate-800">
+                <p className="text-xs font-semibold text-slate-400 mb-2">Supported Ecosystems</p>
+                <div className="flex flex-wrap gap-1">
+                  {["Python", "Java", "JavaScript", "TypeScript", "C#/.NET", "Go", "Rust", "Ruby", "PHP", "C/C++", "Kotlin", "Swift"].map((lang) => (
+                    <span key={lang} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">{lang}</span>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mt-3 pt-3 border-t border-slate-800">
+                <a
+                  href={`${API_URL}/docs`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  API Documentation (Swagger)
+                </a>
+                <a
+                  href={`${API_URL}/redoc`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 text-xs text-slate-400 hover:text-slate-300 transition-colors mt-1"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  API Reference (ReDoc)
+                </a>
               </div>
             </div>
 
@@ -483,109 +949,75 @@ export default function Home() {
               <div className="rounded-xl p-3 lg:p-4 border bg-green-900/30 border-green-700">
                 <div className="flex items-center gap-2 mb-2">
                   <ShieldCheck className="h-4 w-4 lg:h-5 lg:w-5 text-green-400" />
-                  <h3 className="font-semibold text-sm lg:text-base">
-                    Scan Completed
-                  </h3>
+                  <h3 className="font-semibold text-sm lg:text-base">Scan Completed</h3>
                 </div>
-                <p className="text-xs text-slate-300">
-                  Target repository has been successfully analyzed.
-                </p>
+                <p className="text-xs text-slate-300">Target repository has been successfully analyzed.</p>
               </div>
             )}
           </div>
 
           <div className="mt-auto p-3 lg:p-4 border-t border-slate-800">
-            <Link href="/settings">
+            <Link href="/dashboard">
               <button className="w-full flex items-center gap-2 rounded-xl bg-slate-800/50 hover:bg-slate-800 px-3 py-2 transition-colors mb-2">
-                <Settings className="h-4 w-4" />
-                <span className="text-sm">Settings</span>
+                <BarChart3 className="h-4 w-4" /><span className="text-sm">Dashboard</span>
               </button>
             </Link>
-            <div className="text-xs text-slate-400">
-              Enterprise AI Scanner v2.0
-            </div>
+            <Link href="/about">
+              <button className="w-full flex items-center gap-2 rounded-xl bg-slate-800/50 hover:bg-slate-800 px-3 py-2 transition-colors mb-2">
+                <FileText className="h-4 w-4" /><span className="text-sm">Features & Docs</span>
+              </button>
+            </Link>
+            <Link href="/settings">
+              <button className="w-full flex items-center gap-2 rounded-xl bg-slate-800/50 hover:bg-slate-800 px-3 py-2 transition-colors mb-2">
+                <Settings className="h-4 w-4" /><span className="text-sm">Settings</span>
+              </button>
+            </Link>
+            <div className="text-xs text-slate-400">Enterprise AI Scanner v2.2</div>
           </div>
         </aside>
 
         {/* Main Content */}
         <section className="flex-1 overflow-auto p-3 lg:p-6">
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 lg:gap-6">
-            {/* Left Column */}
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 lg:gap-6 h-full">
+            {/* Left Column - Scan Form + Terminal */}
             <div className="space-y-4 lg:space-y-6">
               <Card className="p-4 lg:p-6 rounded-2xl shadow-sm border-slate-200 dark:border-slate-800">
                 <div className="space-y-4 lg:space-y-6">
                   <div>
                     <div className="flex items-center gap-2">
                       <ShieldAlert className="h-5 w-5 lg:h-6 lg:w-6 text-blue-600 dark:text-blue-400" />
-                      <h2 className="text-xl lg:text-2xl font-bold">
-                        AI Vulnerability Remediator
-                      </h2>
+                      <h2 className="text-xl lg:text-2xl font-bold">AI Vulnerability Remediator</h2>
                     </div>
                     <p className="text-muted-foreground text-xs lg:text-sm mt-2">
-                      Scan your GitHub repositories for security vulnerabilities
-                      and receive AI-generated remediation strategies.
+                      Scan your GitHub repositories for security vulnerabilities and receive AI-generated remediation strategies.
                     </p>
-
                     <Dialog>
                       <DialogTrigger asChild>
                         <button className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline mt-2">
-                          <List className="h-3 w-3" />
-                          View sample repositories
-                          <ExternalLink className="h-3 w-3" />
+                          <List className="h-3 w-3" />View sample repositories<ExternalLink className="h-3 w-3" />
                         </button>
                       </DialogTrigger>
                       <DialogContent className="max-w-2xl">
                         <DialogHeader>
-                          <DialogTitle className="flex items-center gap-2">
-                            <GitBranch className="h-5 w-5" />
-                            Sample Repositories
-                          </DialogTitle>
-                          <DialogDescription>
-                            Select a sample repository to test the scanner.
-                          </DialogDescription>
+                          <DialogTitle className="flex items-center gap-2"><GitBranch className="h-5 w-5" />Sample Repositories</DialogTitle>
+                          <DialogDescription>Select a sample repository to test the scanner.</DialogDescription>
                         </DialogHeader>
-
                         <div className="mt-4 rounded-lg border overflow-hidden">
                           <table className="w-full text-sm">
                             <thead className="bg-muted">
                               <tr>
-                                <th className="text-left p-3 font-semibold">
-                                  Repository
-                                </th>
-                                <th className="text-left p-3 font-semibold">
-                                  Language
-                                </th>
-                                <th className="text-center p-3 font-semibold">
-                                  Action
-                                </th>
+                                <th className="text-left p-3 font-semibold">Repository</th>
+                                <th className="text-left p-3 font-semibold">Language</th>
+                                <th className="text-center p-3 font-semibold">Action</th>
                               </tr>
                             </thead>
                             <tbody>
                               {sampleRepos.map((repo, idx) => (
-                                <tr
-                                  key={idx}
-                                  className="border-t hover:bg-muted/50 transition-colors"
-                                >
-                                  <td className="p-3 font-medium">
-                                    {repo.name}
-                                  </td>
-                                  <td className="p-3">
-                                    <Badge
-                                      variant="outline"
-                                      className="text-xs"
-                                    >
-                                      {repo.type}
-                                    </Badge>
-                                  </td>
+                                <tr key={idx} className="border-t hover:bg-muted/50 transition-colors">
+                                  <td className="p-3 font-medium">{repo.name}</td>
+                                  <td className="p-3"><Badge variant="outline" className="text-xs">{repo.type}</Badge></td>
                                   <td className="p-3 text-center">
-                                    <Button
-                                      size="sm"
-                                      variant="ghost"
-                                      onClick={() => setUrl(repo.url)}
-                                      className="h-8 text-xs gap-1"
-                                    >
-                                      Load
-                                    </Button>
+                                    <Button size="sm" variant="ghost" onClick={() => setUrl(repo.url)} className="h-8 text-xs gap-1">Load</Button>
                                   </td>
                                 </tr>
                               ))}
@@ -600,41 +1032,18 @@ export default function Home() {
                     <div className="rounded-lg bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 p-3 lg:p-4">
                       <div className="flex items-center gap-2">
                         <XCircle className="h-4 w-4 text-red-600 dark:text-red-400" />
-                        <p className="text-sm text-red-900 dark:text-red-200">
-                          {errorMessage}
-                        </p>
+                        <p className="text-sm text-red-900 dark:text-red-200">{errorMessage}</p>
                       </div>
                     </div>
                   )}
-
-                  <div className="rounded-lg bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 p-3 lg:p-4">
-                    <div className="flex gap-2 lg:gap-3">
-                      <AlertTriangle className="h-4 w-4 lg:h-5 lg:w-5 text-blue-600 dark:text-blue-500 flex-shrink-0 mt-0.5" />
-                      <div className="space-y-1">
-                        <p className="text-xs lg:text-sm font-semibold text-blue-900 dark:text-blue-100">
-                          Execution Environment Notice
-                        </p>
-                        <p className="text-xs text-blue-800 dark:text-blue-200">
-                          Large repositories may take up to 60 seconds to scan.
-                          Ensure your backend API (http://localhost:8000) is
-                          running.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
 
                   {/* Repository URL Input */}
                   <div className="space-y-2">
                     <Label htmlFor="repo-url">Repository URL</Label>
                     <div className="relative">
                       <GitBranch className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-muted-foreground" />
-                      <Input
-                        id="repo-url"
-                        value={url}
-                        onChange={(e) => setUrl(e.target.value)}
-                        placeholder="https://github.com/username/repository"
-                        className="h-11 pl-10"
-                      />
+                      <Input id="repo-url" value={url} onChange={(e) => setUrl(e.target.value)}
+                        placeholder="https://github.com/username/repository" className="h-11 pl-10" />
                     </div>
                   </div>
 
@@ -642,198 +1051,616 @@ export default function Home() {
                   <div className="space-y-2">
                     <Label>Scan Mode</Label>
                     <div className="grid grid-cols-2 gap-3">
-                      <button
-                        type="button"
-                        onClick={() => setScanMode("scan-only")}
+                      <button type="button" onClick={() => setScanMode("scan-only")}
                         className={`flex items-center gap-2 rounded-xl border-2 p-3 lg:p-4 transition-all ${
-                          scanMode === "scan-only"
-                            ? "border-blue-600 bg-blue-50 dark:bg-blue-950/30"
-                            : "border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600"
-                        }`}
-                      >
-                        <Eye
-                          className={`h-5 w-5 ${
-                            scanMode === "scan-only"
-                              ? "text-blue-600"
-                              : "text-muted-foreground"
-                          }`}
-                        />
+                          scanMode === "scan-only" ? "border-blue-600 bg-blue-50 dark:bg-blue-950/30" : "border-slate-200 dark:border-slate-700 hover:border-slate-300"
+                        }`}>
+                        <Eye className={`h-5 w-5 ${scanMode === "scan-only" ? "text-blue-600" : "text-muted-foreground"}`} />
                         <div className="text-left">
-                          <p
-                            className={`text-sm font-semibold ${
-                              scanMode === "scan-only"
-                                ? "text-blue-900 dark:text-blue-100"
-                                : ""
-                            }`}
-                          >
-                            Scan Only
-                          </p>
-                          <p className="text-xs text-muted-foreground">
-                            Detect vulnerabilities
-                          </p>
+                          <p className={`text-sm font-semibold ${scanMode === "scan-only" ? "text-blue-900 dark:text-blue-100" : ""}`}>Scan Only</p>
+                          <p className="text-xs text-muted-foreground">Detect vulnerabilities</p>
                         </div>
                       </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setScanMode("scan-fix")}
+                      <button type="button" onClick={() => setScanMode("scan-fix")}
                         className={`flex items-center gap-2 rounded-xl border-2 p-3 lg:p-4 transition-all ${
-                          scanMode === "scan-fix"
-                            ? "border-green-600 bg-green-50 dark:bg-green-950/30"
-                            : "border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600"
-                        }`}
-                      >
-                        <Wrench
-                          className={`h-5 w-5 ${
-                            scanMode === "scan-fix"
-                              ? "text-green-600"
-                              : "text-muted-foreground"
-                          }`}
-                        />
+                          scanMode === "scan-fix" ? "border-green-600 bg-green-50 dark:bg-green-950/30" : "border-slate-200 dark:border-slate-700 hover:border-slate-300"
+                        }`}>
+                        <Wrench className={`h-5 w-5 ${scanMode === "scan-fix" ? "text-green-600" : "text-muted-foreground"}`} />
                         <div className="text-left">
-                          <p
-                            className={`text-sm font-semibold ${
-                              scanMode === "scan-fix"
-                                ? "text-green-900 dark:text-green-100"
-                                : ""
-                            }`}
-                          >
-                            Scan & Fix
-                          </p>
-                          <p className="text-xs text-muted-foreground">
-                            Fix & create PR
-                          </p>
+                          <p className={`text-sm font-semibold ${scanMode === "scan-fix" ? "text-green-900 dark:text-green-100" : ""}`}>Scan & Fix</p>
+                          <p className="text-xs text-muted-foreground">Fix & create PR</p>
                         </div>
                       </button>
                     </div>
                   </div>
 
-                  {/* Action Button */}
-                  <Button
-                    className={`w-full h-10 lg:h-11 gap-2 text-sm lg:text-base text-white ${
-                      scanMode === "scan-fix"
-                        ? "bg-green-600 hover:bg-green-700"
-                        : "bg-blue-600 hover:bg-blue-700"
-                    }`}
-                    onClick={runScan}
-                    disabled={loading}
-                  >
-                    {loading ? (
-                      <SearchCode className="h-4 w-4 animate-pulse" />
-                    ) : scanMode === "scan-fix" ? (
-                      <Wrench className="h-4 w-4" />
-                    ) : (
-                      <Eye className="h-4 w-4" />
-                    )}
-                    {loading
-                      ? "Analyzing Repository..."
-                      : scanMode === "scan-fix"
-                      ? "Scan & Fix Repository"
-                      : "Scan Repository"}
+                  <Button className={`w-full h-10 lg:h-11 gap-2 text-sm lg:text-base text-white ${
+                    scanMode === "scan-fix" ? "bg-green-600 hover:bg-green-700" : "bg-blue-600 hover:bg-blue-700"
+                  }`} onClick={runScan} disabled={loading}>
+                    {loading ? <SearchCode className="h-4 w-4 animate-pulse" /> : scanMode === "scan-fix" ? <Wrench className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    {loading ? "Analyzing Repository..." : scanMode === "scan-fix" ? "Scan & Fix Repository" : "Scan Repository"}
                   </Button>
+                </div>
+              </Card>
 
-                  {/* Mode description */}
-                  <p className="text-xs text-muted-foreground text-center">
-                    {scanMode === "scan-fix"
-                      ? "Scans for vulnerabilities, applies AI fix to the first SAST finding, and creates a Pull Request."
-                      : "Scans for all vulnerabilities (SAST + Dependencies) and returns a detailed report without modifying code."}
+              {/* Terminal View - Shows during scan, hides when report is ready */}
+              {showTerminal && (loading || !result) && (
+                <Card className="rounded-2xl shadow-sm overflow-hidden border-slate-200 dark:border-slate-800 bg-slate-950">
+                  <div className="flex items-center justify-between px-4 py-2 bg-slate-800 border-b border-slate-700">
+                    <div className="flex items-center gap-2">
+                      <Terminal className="h-4 w-4 text-green-400" />
+                      <span className="text-sm font-mono text-slate-300">Scan Progress</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {loading && (
+                        <Badge className="bg-green-600/20 text-green-400 border-green-600/30 text-xs animate-pulse">
+                          {currentPhase}
+                        </Badge>
+                      )}
+                      <div className="flex gap-1">
+                        <div className="w-3 h-3 rounded-full bg-red-500"></div>
+                        <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
+                        <div className="w-3 h-3 rounded-full bg-green-500"></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div ref={terminalRef} className="p-4 font-mono text-xs max-h-72 overflow-y-auto space-y-1">
+                    {logs.map((entry, idx) => (
+                      <div key={idx} className={`flex gap-2 ${getLogColor(entry)}`}>
+                        <span className="text-slate-600 select-none">{entry.timestamp}</span>
+                        <span className="select-none">{getLogPrefix(entry)}</span>
+                        <span className="break-all">{entry.message}</span>
+                      </div>
+                    ))}
+                    {loading && (
+                      <div className="flex gap-2 text-slate-500">
+                        <span className="animate-pulse">▌</span>
+                      </div>
+                    )}
+                  </div>
+                </Card>
+              )}
+
+              {/* Missing SDK Install Prompt */}
+              {showInstallPrompt && missingSDKs.length > 0 && (
+                <Card className="rounded-2xl shadow-sm border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-950/20 p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Package className="h-5 w-5 text-orange-600" />
+                    <h3 className="font-semibold text-sm">Missing Dependencies</h3>
+                  </div>
+                  <p className="text-xs text-muted-foreground mb-3">
+                    The following tools are not installed on the server. Some scan features may be limited.
                   </p>
-                </div>
-              </Card>
-
-              {/* Scan Summary Card */}
-              <Card className="p-4 lg:p-6 rounded-2xl shadow-sm border-slate-200 dark:border-slate-800">
-                <div className="flex items-center gap-2 mb-4 lg:mb-5">
-                  <BrainCircuit className="h-4 w-4 lg:h-5 lg:w-5 text-violet-600" />
-                  <h2 className="text-lg lg:text-xl font-bold">
-                    Scan Analysis
-                  </h2>
-                </div>
-
-                {loading ? (
-                  <div className="space-y-3">
-                    <div className="h-4 w-3/4 bg-slate-100 dark:bg-slate-800 rounded animate-pulse"></div>
-                    <div className="h-4 w-1/2 bg-slate-100 dark:bg-slate-800 rounded animate-pulse"></div>
-                    <div className="h-4 w-5/6 bg-slate-100 dark:bg-slate-800 rounded animate-pulse"></div>
+                  <div className="space-y-2">
+                    {missingSDKs.map((sdk, idx) => (
+                      <div key={idx} className="flex items-center justify-between rounded-lg border border-orange-200 dark:border-orange-800 bg-white dark:bg-slate-900 p-3">
+                        <div className="flex items-center gap-2">
+                          <Monitor className="h-4 w-4 text-orange-500" />
+                          <span className="text-sm font-medium">{sdk.name}</span>
+                        </div>
+                        <code className="text-xs bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded font-mono">
+                          {sdk.install_cmd}
+                        </code>
+                      </div>
+                    ))}
                   </div>
-                ) : result ? (
-                  renderSummary()
-                ) : (
-                  <div className="text-muted-foreground text-xs lg:text-sm text-center py-6 border-2 border-dashed rounded-lg border-slate-200 dark:border-slate-800">
-                    Run a scan to view the AI analysis summary.
+                  <Button variant="outline" size="sm" className="mt-3 text-xs"
+                    onClick={() => setShowInstallPrompt(false)}>
+                    Dismiss
+                  </Button>
+                </Card>
+              )}
+
+              {/* Scan Summary Card - Shows when result is ready */}
+              {result && (
+                <Card className="p-4 lg:p-6 rounded-2xl shadow-sm border-slate-200 dark:border-slate-800">
+                  <div className="flex items-center justify-between mb-4 lg:mb-5">
+                    <div className="flex items-center gap-2">
+                      <BrainCircuit className="h-4 w-4 lg:h-5 lg:w-5 text-violet-600" />
+                      <h2 className="text-lg lg:text-xl font-bold">Scan Analysis</h2>
+                    </div>
+                    {showTerminal && (
+                      <Button variant="ghost" size="sm" className="text-xs gap-1"
+                        onClick={() => setShowTerminal(!showTerminal)}>
+                        <Terminal className="h-3 w-3" />
+                        {showTerminal ? "Hide" : "Show"} Logs
+                      </Button>
+                    )}
                   </div>
-                )}
-              </Card>
+                  {renderSummary()}
+                </Card>
+              )}
+
+              {/* Terminal replay when result is ready but user wants to see logs */}
+              {showTerminal && result && logs.length > 0 && (
+                <Card className="rounded-2xl shadow-sm overflow-hidden border-slate-200 dark:border-slate-800 bg-slate-950">
+                  <div className="flex items-center justify-between px-4 py-2 bg-slate-800 border-b border-slate-700">
+                    <div className="flex items-center gap-2">
+                      <Terminal className="h-4 w-4 text-green-400" />
+                      <span className="text-sm font-mono text-slate-300">Scan Logs</span>
+                    </div>
+                    <Button variant="ghost" size="sm" className="text-xs text-slate-400 hover:text-white h-6"
+                      onClick={() => setShowTerminal(false)}>Hide</Button>
+                  </div>
+                  <div className="p-4 font-mono text-xs max-h-48 overflow-y-auto space-y-1">
+                    {logs.map((entry, idx) => (
+                      <div key={idx} className={`flex gap-2 ${getLogColor(entry)}`}>
+                        <span className="text-slate-600 select-none">{entry.timestamp}</span>
+                        <span className="select-none">{getLogPrefix(entry)}</span>
+                        <span className="break-all">{entry.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+              )}
             </div>
 
-            {/* Right Column - Raw JSON Results */}
+            {/* Right Column - Report Panel */}
             <Card className="flex flex-col p-0 rounded-2xl shadow-sm overflow-hidden border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 min-h-[400px] xl:min-h-0 xl:h-[calc(100vh-4rem)]">
               <div className="flex items-center justify-between p-4 lg:p-6 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-background">
                 <div>
-                  <h2 className="text-xl lg:text-2xl font-bold">
-                    Scan Report
-                  </h2>
+                  <h2 className="text-xl lg:text-2xl font-bold">Scan Report</h2>
                   <p className="text-muted-foreground text-xs lg:text-sm mt-1">
-                    Raw JSON output of identified vulnerabilities and
-                    remediation steps.
+                    {result ? "Vulnerability scan results and remediation details." : "Generate a scan to view the report."}
                   </p>
                 </div>
-
                 {result && (
-                  <div className="flex gap-2">
-                    <Button
-                      variant="outline"
-                      size="icon"
-                      onClick={copyResult}
-                      title={copied ? "Copied!" : "Copy to clipboard"}
-                      className="h-9 w-9"
-                    >
-                      {copied ? (
-                        <CheckCircle2 className="h-4 w-4 text-green-600" />
-                      ) : (
-                        <Copy className="h-4 w-4" />
-                      )}
+                  <div className="flex gap-2 flex-wrap">
+                    {/* View Toggle */}
+                    <div className="flex rounded-lg border overflow-hidden">
+                      <button onClick={() => setReportView("report")}
+                        className={`px-2 py-1 text-xs ${reportView === "report" ? "bg-blue-600 text-white" : "bg-white dark:bg-slate-800 text-muted-foreground"}`}>
+                        Report
+                      </button>
+                      <button onClick={() => setReportView("json")}
+                        className={`px-2 py-1 text-xs ${reportView === "json" ? "bg-blue-600 text-white" : "bg-white dark:bg-slate-800 text-muted-foreground"}`}>
+                        JSON
+                      </button>
+                    </div>
+                    <Button variant="outline" size="icon" onClick={copyResult}
+                      title={copied ? "Copied!" : "Copy to clipboard"} className="h-9 w-9">
+                      {copied ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
                     </Button>
-                    <Button
-                      variant="outline"
-                      size="icon"
-                      onClick={downloadResult}
-                      title="Download as JSON"
-                      className="h-9 w-9"
-                    >
+                    <Button variant="outline" size="icon" onClick={downloadResult}
+                      title="Download as JSON" className="h-9 w-9">
                       <Download className="h-4 w-4" />
                     </Button>
-                    <Button
-                      variant="outline"
-                      size="icon"
-                      onClick={downloadPDF}
-                      title="Download as PDF"
-                      className="h-9 w-9"
-                    >
+                    <Button variant="outline" size="icon" onClick={downloadPDF}
+                      title="Download as PDF" className="h-9 w-9">
                       <FileText className="h-4 w-4" />
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={downloadSARIF}
+                      title="Export SARIF (GitHub/Azure)" className="h-9 text-xs px-2">
+                      SARIF
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={downloadCSV}
+                      title="Export CSV (Excel/JIRA)" className="h-9 text-xs px-2">
+                      CSV
                     </Button>
                   </div>
                 )}
               </div>
 
               <div className="flex-1 overflow-auto p-4 lg:p-6">
-                {loading ? (
+                {loading && !result ? (
                   <div className="flex flex-col items-center justify-center h-full space-y-4 text-muted-foreground">
-                    <SearchCode className="h-8 w-8 animate-pulse text-blue-500" />
-                    <p className="text-sm">
-                      {scanMode === "scan-fix"
-                        ? "Scanning, fixing, and generating PR..."
-                        : "Scanning codebase for vulnerabilities..."}
-                    </p>
+                    <Terminal className="h-8 w-8 animate-pulse text-green-500" />
+                    <p className="text-sm font-mono">{currentPhase || "Initializing..."}</p>
+                    <div className="w-48 h-1 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                      <div className="h-full bg-green-500 rounded-full animate-pulse" style={{ width: "60%" }}></div>
+                    </div>
                   </div>
                 ) : result ? (
-                  <pre className="text-xs lg:text-sm font-mono text-slate-800 dark:text-slate-300 whitespace-pre-wrap break-all">
-                    {JSON.stringify(result, null, 2)}
-                  </pre>
+                  reportView === "json" ? (
+                    <pre className="text-xs lg:text-sm font-mono text-slate-800 dark:text-slate-300 whitespace-pre-wrap break-all leading-relaxed">
+                      {JSON.stringify(result, null, 2)}
+                    </pre>
+                  ) : (
+                    <div className="space-y-6">
+                      {/* Report Header */}
+                      <div className="border-b pb-4">
+                        <h3 className="text-lg font-bold">Vulnerability Scan Report</h3>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Repository: <span className="font-mono">{result.repo || url}</span>
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Scanned: {new Date().toLocaleDateString()} at {new Date().toLocaleTimeString()}
+                        </p>
+                      </div>
+
+                      {/* Executive Summary */}
+                      <div>
+                        <h4 className="text-sm font-semibold mb-3">Executive Summary</h4>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-center">
+                            <p className="text-2xl font-bold">{result.total_findings || 0}</p>
+                            <p className="text-xs text-muted-foreground">Total Findings</p>
+                          </div>
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-center">
+                            <p className="text-2xl font-bold text-red-600">
+                              {(result.scan_summary?.by_severity?.CRITICAL || 0) + (result.scan_summary?.by_severity?.HIGH || 0)}
+                            </p>
+                            <p className="text-xs text-muted-foreground">Critical/High</p>
+                          </div>
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-center">
+                            <p className="text-2xl font-bold text-yellow-600">
+                              {result.scan_summary?.by_severity?.MEDIUM || result.scan_summary?.by_severity?.WARNING || 0}
+                            </p>
+                            <p className="text-xs text-muted-foreground">Medium</p>
+                          </div>
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-center">
+                            <p className="text-2xl font-bold text-blue-600">
+                              {(result.scan_summary?.by_severity?.LOW || 0) + (result.scan_summary?.by_severity?.INFO || 0)}
+                            </p>
+                            <p className="text-xs text-muted-foreground">Low/Info</p>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Status */}
+                      <div className={`rounded-lg p-4 ${
+                        result.status === "clean" ? "bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800" :
+                        result.status === "success" && result.pull_request ? "bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800" :
+                        result.status === "error" ? "bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800" :
+                        "bg-orange-50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800"
+                      }`}>
+                        <p className="text-sm font-semibold">
+                          {result.status === "clean" ? "✅ No vulnerabilities found" :
+                           result.status === "success" && result.pull_request ? "✅ Vulnerabilities fixed — PR created" :
+                           result.status === "success" && !result.pull_request ? `⚠️ ${result.total_findings || 0} vulnerabilities detected` :
+                           result.status === "error" ? "❌ Scan failed" :
+                           `⚠️ ${result.total_findings || 0} vulnerabilities detected`}
+                        </p>
+                        {result.message && !result.pull_request && (
+                          <p className="text-xs text-muted-foreground mt-1">{result.message}</p>
+                        )}
+                        {result.pull_request && (
+                          <a href={result.pull_request} target="_blank" rel="noopener noreferrer"
+                            className="text-xs text-blue-600 hover:underline mt-1 inline-block">
+                            View Pull Request →
+                          </a>
+                        )}
+                      </div>
+
+                      {/* Project Info */}
+                      {result.project_info && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">Project Information</h4>
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-sm space-y-1">
+                            <div className="flex justify-between">
+                              <span className="text-muted-foreground">Languages</span>
+                              <span>{result.project_info.languages?.join(", ") || "Unknown"}</span>
+                            </div>
+                            {result.project_info.frameworks?.length > 0 && (
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Frameworks</span>
+                                <span>{result.project_info.frameworks.join(", ")}</span>
+                              </div>
+                            )}
+                            {result.project_info.build_tools?.length > 0 && (
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Build Tools</span>
+                                <span>{result.project_info.build_tools.join(", ")}</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Quality Gate */}
+                      {result.code_quality?.quality_gate_details && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">Quality Gate</h4>
+                          <div className={`rounded-lg border p-3 ${
+                            result.code_quality.quality_gate_details.passed
+                              ? "border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/20"
+                              : "border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/20"
+                          }`}>
+                            <div className="flex items-center gap-2 mb-2">
+                              {result.code_quality.quality_gate_details.passed
+                                ? <CheckCircle2 className="h-4 w-4 text-green-600" />
+                                : <XCircle className="h-4 w-4 text-red-600" />}
+                              <span className="text-sm font-semibold">
+                                {result.code_quality.quality_gate_details.passed ? "PASSED" : "FAILED"}
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2 text-xs">
+                              {result.code_quality.quality_gate_details.conditions?.map((c: any, i: number) => (
+                                <div key={i} className="flex items-center gap-1">
+                                  <span>{c.status === "PASSED" ? "✓" : "✗"}</span>
+                                  <span className="text-muted-foreground">{c.metric.replace(/_/g, " ")}: </span>
+                                  <span className="font-mono">{typeof c.actual === "number" ? c.actual.toFixed(1) : c.actual}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Code Quality Metrics */}
+                      {result.code_quality?.metrics && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">Code Quality Metrics</h4>
+                          <div className="rounded-lg bg-white dark:bg-slate-800 border p-3 text-sm">
+                            <div className="grid grid-cols-2 gap-3">
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Maintainability</span>
+                                <span className={`font-bold ${ratingColor(result.code_quality.metrics.complexity?.maintainability_rating)}`}>
+                                  {result.code_quality.metrics.complexity?.maintainability_rating || "—"}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Duplication</span>
+                                <span className="font-mono">{result.code_quality.metrics.duplication?.duplication_percentage?.toFixed(1)}%</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Tech Debt</span>
+                                <span className="font-mono">{result.code_quality.metrics.technical_debt?.total_hours?.toFixed(1)}h</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Code Smells</span>
+                                <span className="font-mono">{result.code_quality.code_smells?.total || 0}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Lines of Code</span>
+                                <span className="font-mono">{result.code_quality.metrics.lines_of_code?.code_lines?.toLocaleString()}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Avg Complexity</span>
+                                <span className="font-mono">{result.code_quality.metrics.complexity?.average_complexity?.toFixed(1)}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Compliance Dashboard */}
+                      {result.compliance && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">Compliance Status</h4>
+                          <div className="grid grid-cols-3 gap-3 mb-3">
+                            <div className="rounded-lg border p-3 text-center">
+                              <p className="text-xs text-muted-foreground">OWASP Top 10</p>
+                              <p className={`text-xl font-bold ${
+                                result.compliance.owasp_top_10.compliance_score >= 80 ? "text-green-600" :
+                                result.compliance.owasp_top_10.compliance_score >= 50 ? "text-yellow-600" : "text-red-600"
+                              }`}>{result.compliance.owasp_top_10.compliance_score}%</p>
+                              <p className="text-[10px] text-muted-foreground">
+                                {result.compliance.owasp_top_10.violations}/10 categories violated
+                              </p>
+                            </div>
+                            <div className="rounded-lg border p-3 text-center">
+                              <p className="text-xs text-muted-foreground">PCI-DSS</p>
+                              <p className={`text-xl font-bold ${
+                                result.compliance.pci_dss.compliance_score >= 80 ? "text-green-600" :
+                                result.compliance.pci_dss.compliance_score >= 50 ? "text-yellow-600" : "text-red-600"
+                              }`}>{result.compliance.pci_dss.compliance_score}%</p>
+                              <p className="text-[10px] text-muted-foreground">
+                                {result.compliance.pci_dss.violations} requirements failed
+                              </p>
+                            </div>
+                            <div className="rounded-lg border p-3 text-center">
+                              <p className="text-xs text-muted-foreground">Overall</p>
+                              <p className={`text-xl font-bold ${
+                                result.compliance.overall_compliance_score >= 80 ? "text-green-600" :
+                                result.compliance.overall_compliance_score >= 50 ? "text-yellow-600" : "text-red-600"
+                              }`}>{result.compliance.overall_compliance_score}%</p>
+                              <p className="text-[10px] text-muted-foreground">compliance score</p>
+                            </div>
+                          </div>
+
+                          {/* OWASP Details */}
+                          {result.compliance.owasp_top_10.details.some((d: any) => d.violations > 0) && (
+                            <div className="rounded-lg border p-3 text-xs space-y-1">
+                              <p className="font-semibold text-muted-foreground mb-2">OWASP Top 10 Violations</p>
+                              {result.compliance.owasp_top_10.details
+                                .filter((d: any) => d.violations > 0)
+                                .map((d: any, i: number) => (
+                                  <div key={i} className="flex items-center justify-between">
+                                    <span>{d.code}: {d.name}</span>
+                                    <Badge className="bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300 text-[10px]">
+                                      {d.violations} findings
+                                    </Badge>
+                                  </div>
+                                ))}
+                            </div>
+                          )}
+
+                          {/* CWE List */}
+                          {result.compliance.cwe?.details?.length > 0 && (
+                            <div className="rounded-lg border p-3 text-xs mt-2">
+                              <p className="font-semibold text-muted-foreground mb-2">
+                                CWE Weaknesses ({result.compliance.cwe.unique_weaknesses})
+                              </p>
+                              <div className="space-y-1 max-h-24 overflow-y-auto">
+                                {result.compliance.cwe.details.slice(0, 8).map((c: any, i: number) => (
+                                  <div key={i} className="flex justify-between">
+                                    <span className="font-mono">{c.id}</span>
+                                    <span className="text-muted-foreground">{c.name} ({c.count})</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Baseline Info */}
+                      {(result.new_since_baseline !== undefined || result.suppressed_count > 0) && (
+                        <div className="rounded-lg border p-3 space-y-2">
+                          <p className="text-xs font-semibold text-muted-foreground">Baseline & Suppressions</p>
+                          <div className="grid grid-cols-2 gap-3 text-xs">
+                            {result.new_since_baseline !== undefined && (
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">New since baseline</span>
+                                <span className={`font-bold ${result.new_since_baseline > 0 ? "text-red-600" : "text-green-600"}`}>
+                                  {result.new_since_baseline > 0 ? `+${result.new_since_baseline}` : "0 new"}
+                                </span>
+                              </div>
+                            )}
+                            {result.suppressed_count > 0 && (
+                              <div className="flex justify-between">
+                                <span className="text-muted-foreground">Suppressed</span>
+                                <span className="text-slate-500">{result.suppressed_count} hidden</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Findings Table */}
+                      {result.findings?.length > 0 && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">
+                            Vulnerability Details ({result.findings.length})
+                          </h4>
+                          <div className="rounded-lg border overflow-hidden">
+                            <table className="w-full text-xs">
+                              <thead className="bg-muted">
+                                <tr>
+                                  <th className="text-left p-2 font-semibold">Severity</th>
+                                  <th className="text-left p-2 font-semibold">File</th>
+                                  <th className="text-left p-2 font-semibold hidden sm:table-cell">Rule</th>
+                                  <th className="text-left p-2 font-semibold">Description</th>
+                                  <th className="text-center p-2 font-semibold w-16">Action</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {result.findings.slice(0, 50).map((f: any, idx: number) => (
+                                  <tr key={idx} className="border-t hover:bg-muted/30">
+                                    <td className="p-2">
+                                      <Badge className={`${severityColor(f.adjusted_severity || f.severity)} text-[10px]`}>
+                                        {f.adjusted_severity || f.severity}
+                                      </Badge>
+                                    </td>
+                                    <td className="p-2 font-mono text-muted-foreground max-w-[120px] truncate">
+                                      {f.path}{f.line ? `:${f.line}` : ""}
+                                    </td>
+                                    <td className="p-2 font-mono text-muted-foreground hidden sm:table-cell max-w-[100px] truncate">
+                                      {f.rule_id}
+                                    </td>
+                                    <td className="p-2 max-w-[200px]">
+                                      <p className="truncate">{f.message?.slice(0, 120)}</p>
+                                      {f.metadata?.category === "secret" && (
+                                        <span className="text-[10px] text-red-600 font-semibold">🔑 SECRET</span>
+                                      )}
+                                    </td>
+                                    <td className="p-2 text-center">
+                                      <button
+                                        onClick={() => suppressFinding(f.rule_id, f.path)}
+                                        className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 hover:bg-orange-100 dark:hover:bg-orange-950 text-muted-foreground hover:text-orange-600 transition-colors"
+                                        title="Suppress this finding"
+                                      >
+                                        Suppress
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            {result.findings.length > 50 && (
+                              <div className="p-2 text-center text-xs text-muted-foreground bg-muted/30">
+                                Showing 50 of {result.findings.length} findings. Export full report for all details.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Fix Results (for scan-fix mode) */}
+                      {result.files_fixed?.length > 0 && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2">Issues Fixed by AI Vulnerability Remediator</h4>
+
+                          {/* Fix Details Table */}
+                          {result.files_fixed.some((f: any) => f.fix_details?.length > 0) && (
+                            <div className="rounded-lg border overflow-hidden mb-3">
+                              <table className="w-full text-xs">
+                                <thead className="bg-muted">
+                                  <tr>
+                                    <th className="text-left p-2 font-semibold">#</th>
+                                    <th className="text-left p-2 font-semibold">Issue Found</th>
+                                    <th className="text-left p-2 font-semibold">Status</th>
+                                    <th className="text-left p-2 font-semibold">File</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {result.files_fixed.flatMap((f: any, fIdx: number) =>
+                                    (f.fix_details || []).map((detail: any, dIdx: number) => (
+                                      <tr key={`${fIdx}-${dIdx}`} className="border-t">
+                                        <td className="p-2 text-muted-foreground">{fIdx + dIdx + 1}</td>
+                                        <td className="p-2">
+                                          <span className="text-orange-600">⚠️</span> {detail.issue?.slice(0, 80)}
+                                        </td>
+                                        <td className="p-2">
+                                          <span className="text-green-600">✅ Fixed</span>
+                                        </td>
+                                        <td className="p-2 font-mono text-muted-foreground">{f.path}</td>
+                                      </tr>
+                                    ))
+                                  ).slice(0, 20)}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+
+                          {/* Files Summary */}
+                          <div className="rounded-lg border overflow-hidden">
+                            <table className="w-full text-xs">
+                              <thead className="bg-muted">
+                                <tr>
+                                  <th className="text-left p-2 font-semibold">File</th>
+                                  <th className="text-center p-2 font-semibold">Issues Fixed</th>
+                                  <th className="text-center p-2 font-semibold">Confidence</th>
+                                  <th className="text-center p-2 font-semibold">Changes</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {result.files_fixed.map((f: any, idx: number) => (
+                                  <tr key={idx} className="border-t">
+                                    <td className="p-2 font-mono text-muted-foreground">{f.path}</td>
+                                    <td className="p-2 text-center">{f.findings_fixed}</td>
+                                    <td className="p-2 text-center">
+                                      {f.confidence >= 0 ? (
+                                        <span className={`font-semibold ${
+                                          f.confidence >= 90 ? "text-green-600" :
+                                          f.confidence >= 70 ? "text-blue-600" : "text-yellow-600"
+                                        }`}>{f.confidence}%</span>
+                                      ) : "—"}
+                                    </td>
+                                    <td className="p-2 text-center text-muted-foreground">
+                                      {f.diff ? `+${f.diff.additions} -${f.diff.deletions}` : "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Errors */}
+                      {result.errors?.length > 0 && (
+                        <div>
+                          <h4 className="text-sm font-semibold mb-2 text-red-600">Scan Errors</h4>
+                          <div className="rounded-lg border border-red-200 dark:border-red-800 p-3 space-y-1">
+                            {result.errors.map((err: any, idx: number) => (
+                              <p key={idx} className="text-xs text-red-700 dark:text-red-300">
+                                • {typeof err === "string" ? err : err.message || JSON.stringify(err)}
+                              </p>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
                 ) : (
                   <div className="flex flex-col items-center justify-center h-full text-muted-foreground space-y-3">
                     <ShieldCheck className="h-12 w-12 opacity-20" />
                     <p className="text-sm">No report generated yet.</p>
+                    <p className="text-xs text-center max-w-xs">
+                      Enter a GitHub repository URL and click scan to generate a vulnerability report.
+                    </p>
                   </div>
                 )}
               </div>

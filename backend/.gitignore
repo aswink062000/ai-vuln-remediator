@@ -36,3 +36,7 @@ app/reports/fonts/
 
 # Cloned repos (runtime)
 /repos/
+
+# SQLite credential store (contains encrypted secrets)
+data/
+*.db
