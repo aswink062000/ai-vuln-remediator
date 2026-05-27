@@ -36,38 +36,64 @@ IS_WINDOWS = PLATFORM == "Windows"
 def _pip_install(package: str) -> bool:
     """
     Install a Python package using pip.
+    Works on system Python (no venv), venv, Docker, Mac, Windows, Linux.
     Returns True if installation succeeded.
     """
     logger.info(f"Auto-installing: {package}")
     try:
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet", package]
+
+        # If not in a venv, handle system Python restrictions
+        if not _is_in_venv():
+            # Try --user first, fall back to --break-system-packages (PEP 668)
+            cmd.insert(4, "--user")
+
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", package],
+            cmd,
             capture_output=True,
             text=False,
             timeout=120
         )
-        stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
         stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
 
         if result.returncode == 0:
             logger.info(f"Successfully installed: {package}")
             return True
-        else:
-            logger.warning(f"Failed to install {package}: {stderr[:500]}")
-            return False
+
+        # If --user failed due to PEP 668 (externally-managed), retry with --break-system-packages
+        if "externally-managed" in stderr.lower() or "PEP 668" in stderr:
+            logger.info(f"Retrying {package} install with --break-system-packages...")
+            cmd_retry = [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", package]
+            result2 = subprocess.run(cmd_retry, capture_output=True, text=False, timeout=120)
+            if result2.returncode == 0:
+                logger.info(f"Successfully installed: {package} (system-wide)")
+                return True
+
+        logger.warning(f"Failed to install {package}: {stderr[:500]}")
+        return False
     except Exception as e:
         logger.warning(f"Exception installing {package}: {e}")
         return False
 
 
+def _is_in_venv() -> bool:
+    """Check if running inside a virtual environment."""
+    return (
+        hasattr(sys, "real_prefix") or  # virtualenv
+        (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)  # venv
+    )
+
+
 def _ensure_dependencies():
     """
     Ensure all required dependencies are installed.
+    Prefers OpenGrep over Semgrep (license-free).
     Auto-installs missing packages.
     """
-    # Check and install semgrep
-    if not shutil.which("semgrep") and not _find_semgrep_binary():
-        logger.info("semgrep not found, attempting auto-install...")
+    # Check if either opengrep or semgrep is available
+    if not shutil.which("opengrep") and not shutil.which("semgrep") and not _find_semgrep_binary():
+        logger.info("No SAST scanner found, attempting auto-install...")
+        # Try semgrep (available on PyPI; opengrep not yet on PyPI)
         _pip_install("semgrep")
 
     # Check and install certifi (for SSL certificate handling)
@@ -87,25 +113,44 @@ def _ensure_dependencies():
 
 def _find_semgrep_binary() -> Optional[str]:
     """
-    Find the semgrep binary across Windows, macOS, and Linux.
-    Checks venv, user installs, and common system locations.
+    Find the SAST scanner binary across Windows, macOS, and Linux.
+    Prefers OpenGrep (fully open-source fork) over Semgrep.
+    Works with or without a virtual environment.
+    Priority: opengrep → semgrep (system PATH → user bin → common locations).
     """
+    # Try OpenGrep first (LGPL-2.1, no license restrictions)
+    opengrep_name = "opengrep.exe" if IS_WINDOWS else "opengrep"
+    opengrep_path = shutil.which(opengrep_name)
+    if opengrep_path:
+        logger.info(f"Using OpenGrep (open-source): {opengrep_path}")
+        return opengrep_path
+
+    # Check common OpenGrep install locations
+    if not IS_WINDOWS:
+        for p in [
+            Path.home() / ".local" / "bin" / opengrep_name,
+            Path("/usr/local/bin") / opengrep_name,
+            Path("/opt/homebrew/bin") / opengrep_name,
+        ]:
+            if p.exists():
+                logger.info(f"Using OpenGrep (open-source): {p}")
+                return str(p)
+
+    # Fall back to Semgrep
     binary_name = "semgrep.exe" if IS_WINDOWS else "semgrep"
 
-    # 1. Check in the same directory as the running Python interpreter
-    python_dir = Path(sys.executable).parent
-    semgrep_in_env = python_dir / binary_name
-    if semgrep_in_env.exists():
-        return str(semgrep_in_env)
+    # 1. Check system PATH first (works for Docker, system installs, brew, etc.)
+    path_bin = shutil.which(binary_name)
+    if path_bin:
+        return path_bin
 
-    if IS_WINDOWS:
-        # Windows: check Scripts subdirectory
-        scripts_dir = python_dir / "Scripts"
-        semgrep_in_scripts = scripts_dir / binary_name
-        if semgrep_in_scripts.exists():
-            return str(semgrep_in_scripts)
-
-        # User site-packages Scripts (pip install --user)
+    # 2. Check user bin directory (pip install --user puts binaries here)
+    if not IS_WINDOWS:
+        user_bin = Path.home() / ".local" / "bin" / binary_name
+        if user_bin.exists():
+            return str(user_bin)
+    else:
+        # Windows user Scripts
         user_scripts = (
             Path.home() / "AppData" / "Roaming" / "Python"
             / f"Python{sys.version_info.major}{sys.version_info.minor}"
@@ -114,7 +159,6 @@ def _find_semgrep_binary() -> Optional[str]:
         if user_scripts.exists():
             return str(user_scripts)
 
-        # Local Programs install
         local_scripts = (
             Path.home() / "AppData" / "Local" / "Programs" / "Python"
             / f"Python{sys.version_info.major}{sys.version_info.minor}"
@@ -123,33 +167,46 @@ def _find_semgrep_binary() -> Optional[str]:
         if local_scripts.exists():
             return str(local_scripts)
 
-    else:
-        # macOS / Linux: check common locations
+    # 3. Check in the same directory as the running Python interpreter
+    python_dir = Path(sys.executable).parent
+    semgrep_in_env = python_dir / binary_name
+    if semgrep_in_env.exists():
+        return str(semgrep_in_env)
+
+    if IS_WINDOWS:
+        scripts_dir = python_dir / "Scripts"
+        semgrep_in_scripts = scripts_dir / binary_name
+        if semgrep_in_scripts.exists():
+            return str(semgrep_in_scripts)
+
+    # 4. macOS / Linux: check common system locations
+    if not IS_WINDOWS:
         common_paths = [
-            Path.home() / ".local" / "bin" / binary_name,
             Path("/usr/local/bin") / binary_name,
             Path("/opt/homebrew/bin") / binary_name,
+            Path("/usr/bin") / binary_name,
             Path("/usr/local/opt/semgrep/bin") / binary_name,
         ]
         for p in common_paths:
             if p.exists():
                 return str(p)
 
-    # Fall back to system PATH
+    # 5. Final fallback — re-check PATH (in case it was updated)
     return shutil.which("semgrep")
 
 
 def _get_semgrep_path() -> str:
     """
-    Get semgrep binary path. Auto-installs if not found.
-    Raises FileNotFoundError if semgrep cannot be found or installed.
+    Get SAST scanner binary path (OpenGrep or Semgrep).
+    Auto-installs if not found.
+    Raises FileNotFoundError if neither can be found or installed.
     """
     path = _find_semgrep_binary()
     if path:
         return path
 
     # Try auto-install
-    logger.info("semgrep not found, attempting auto-install...")
+    logger.info("No SAST scanner found, attempting auto-install...")
     if _pip_install("semgrep"):
         # Re-check after install
         path = _find_semgrep_binary()
@@ -157,15 +214,15 @@ def _get_semgrep_path() -> str:
             return path
 
     raise FileNotFoundError(
-        "semgrep not found and auto-install failed.\n"
-        "Please install manually:\n"
-        "  pip install semgrep\n"
+        "Neither OpenGrep nor Semgrep found, and auto-install failed.\n"
+        "Please install one of:\n"
+        "  Option 1 (recommended): Download OpenGrep from https://github.com/opengrep/opengrep/releases\n"
+        "  Option 2: pip install semgrep\n"
         + (
-            "On Windows, ensure the Python Scripts folder is in your PATH:\n"
-            "  Typical: C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\Python3x\\Scripts\\"
+            "On Windows, ensure the Scripts folder is in your PATH.\n"
             if IS_WINDOWS
-            else "On macOS/Linux, ensure ~/.local/bin is in your PATH.\n"
-            "  Or install via: brew install semgrep (macOS)"
+            else "On macOS: brew install semgrep\n"
+            "On Linux: pip install --user semgrep (ensure ~/.local/bin is in PATH)\n"
         )
     )
 
@@ -241,9 +298,14 @@ def _get_subprocess_env() -> dict:
         if home_local_bin.exists():
             extra_paths.append(str(home_local_bin))
 
+        # Common system paths
+        for sys_path in ["/usr/local/bin", "/usr/bin"]:
+            if Path(sys_path).exists() and sys_path not in extra_paths:
+                extra_paths.append(sys_path)
+
         if PLATFORM == "Darwin":
-            for brew_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
-                if Path(brew_path).exists():
+            for brew_path in ["/opt/homebrew/bin"]:
+                if Path(brew_path).exists() and brew_path not in extra_paths:
                     extra_paths.append(brew_path)
 
     current_path = env.get("PATH", "")
@@ -333,12 +395,25 @@ def run_semgrep(repo_path: str) -> Dict[str, Any]:
     # Step 2: Build environment
     env = _get_subprocess_env()
 
+    # Exclude directories that are never useful to scan (speeds up large repos significantly)
+    exclude_args = [
+        "--exclude", "node_modules",
+        "--exclude", "vendor",
+        "--exclude", "target",
+        "--exclude", "build",
+        "--exclude", "dist",
+        "--exclude", ".git",
+        "--exclude", "*.min.js",
+        "--exclude", "*.min.css",
+        "--exclude", "*.map",
+    ]
+
     # --- Attempt 1: --config=auto (best coverage) ---
     cmd = [
         semgrep_bin, "scan",
         "--config", "auto",
         "--json",
-        "--no-git-ignore",
+        *exclude_args,
         repo_path
     ]
 
@@ -379,7 +454,7 @@ def run_semgrep(repo_path: str) -> Dict[str, Any]:
             semgrep_bin, "scan",
             "--config", config,
             "--json",
-            "--no-git-ignore",
+            *exclude_args,
             repo_path
         ]
 

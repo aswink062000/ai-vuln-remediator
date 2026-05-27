@@ -2,22 +2,21 @@ version: "3.8"
 
 services:
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    build: ./backend
     ports:
       - "8000:8000"
-    env_file:
-      - ./backend/.env
     environment:
-      - CORS_ORIGINS=http://localhost:3000,http://frontend:3000
-      - RATE_LIMIT_MAX_REQUESTS=60
-      - RATE_LIMIT_WINDOW_SECONDS=60
+      - PORT=8000
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER}
+      - CORS_ORIGINS=http://localhost:3000
     volumes:
-      - /tmp/repos:/tmp/repos
-    restart: unless-stopped
+      - backend-data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -25,13 +24,15 @@ services:
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
+        - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+        - NEXT_PUBLIC_API_KEY=${API_SECRET_KEY}
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
     depends_on:
       backend:
         condition: service_healthy
-    restart: unless-stopped
+
+volumes:
+  backend-data:

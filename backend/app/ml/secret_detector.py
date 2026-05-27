@@ -15,7 +15,7 @@ import re
 import math
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -200,18 +200,44 @@ def _shannon_entropy(data: str) -> float:
     if not data:
         return 0.0
 
-    freq = {}
+    # Count occurrences of each character
+    counts = {}
     for char in data:
-        freq[char] = freq.get(char, 0) + 1
+        counts[char] = counts.get(char, 0) + 1
 
+    # Calculate entropy
     entropy = 0.0
-    length = len(data)
-    for count in freq.values():
-        p = count / length
-        if p > 0:
-            entropy -= p * math.log2(p)
+    for count in counts.values():
+        p = count / len(data)
+        entropy -= p * math.log2(p)
 
     return entropy
+
+
+def is_safe_to_apply(code: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if the generated code is safe to apply (no secrets introduced).
+    Returns (is_safe, error_message).
+    """
+    # We use a simplified version of run_secret_scan for a single string of code
+    findings = []
+    lines = code.splitlines()
+
+    for line_num, line in enumerate(lines, 1):
+        for pattern, description in SECRET_PATTERNS:
+            match = re.search(pattern, line)
+            if match:
+                matched_text = match.group(0)
+                if not _is_placeholder(matched_text, line):
+                    # Check entropy for generic patterns
+                    if "High-entropy" in description:
+                        secret_value = match.group(1) if match.lastindex else matched_text
+                        if _shannon_entropy(secret_value) < 3.5:
+                            continue
+
+                    return False, f"Security Violation: Potential {description} detected in generated code."
+
+    return True, None
 
 
 def _mask_secret(value: str) -> str:

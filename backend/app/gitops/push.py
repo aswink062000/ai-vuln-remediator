@@ -16,8 +16,9 @@ def push_changes(repo_path: str, branch_name: str):
 
     # If using HTTPS remote, inject token for auth
     token = os.getenv("GITHUB_TOKEN")
+    original_url = origin.url
     if token:
-        remote_url = origin.url
+        remote_url = original_url
         if remote_url.startswith("https://github.com/"):
             auth_url = remote_url.replace(
                 "https://github.com/",
@@ -26,6 +27,12 @@ def push_changes(repo_path: str, branch_name: str):
             repo.git.remote("set-url", "origin", auth_url)
             logger.info("Set authenticated remote URL")
 
-    logger.info(f"Pushing branch: {branch_name}")
-    origin.push(branch_name)
-    logger.info(f"Successfully pushed {branch_name}")
+    try:
+        logger.info(f"Pushing branch: {branch_name}")
+        origin.push(branch_name)
+        logger.info(f"Successfully pushed {branch_name}")
+    finally:
+        # Reset remote URL to remove token from disk/config
+        if token and original_url.startswith("https://github.com/"):
+            repo.git.remote("set-url", "origin", original_url)
+            logger.info("Reset remote URL to remove token")

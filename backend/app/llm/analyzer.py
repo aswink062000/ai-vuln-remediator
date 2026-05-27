@@ -12,14 +12,10 @@ import hashlib
 import logging
 from typing import Optional, List, Dict, Any
 
-from app.llm.skill_loader import load_skill
 from app.llm.llm_router import router as llm_router
 from app.llm.context_extractor import extract_relevant_context, reconstruct_full_file, estimate_tokens
 
 logger = logging.getLogger(__name__)
-
-# Load the skill prompt once
-skill = load_skill()
 
 # Simple in-memory fix cache (avoids re-calling LLM for same issue)
 _fix_cache: Dict[str, str] = {}
@@ -31,6 +27,8 @@ def analyze_and_fix(
     issue: str,
     file_path: str = "",
     findings: Optional[List[Dict[str, Any]]] = None,
+    extra_instructions: str = "",
+    project_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Use the LLM router to generate a fix for the vulnerability.
@@ -39,6 +37,8 @@ def analyze_and_fix(
     1. Context extraction — only sends relevant function/block (60-80% token savings)
     2. Caching — same code + issue returns cached fix
     3. Compressed prompt — minimal tokens, maximum clarity
+    4. Language-specific skill — focused rules for the project's language
+    5. Extra instructions — per-scan custom instructions from user (additive, not override)
     """
     # Check cache first
     cache_key = _cache_key(code, issue)
@@ -58,7 +58,7 @@ def analyze_and_fix(
         context = {"line_offset": 0, "full_code": code}
 
     # Build optimized prompt
-    prompt = _build_prompt(context_code, issue)
+    prompt = _build_prompt(context_code, issue, extra_instructions, project_info)
 
     logger.info(f"LLM prompt: ~{estimate_tokens(prompt)} tokens")
 
@@ -82,14 +82,33 @@ def analyze_and_fix(
     return fixed_code
 
 
-def _build_prompt(code: str, issue: str) -> str:
+def _build_prompt(code: str, issue: str, extra_instructions: str = "", project_info: Dict[str, Any] = None) -> str:
     """
     Build a token-efficient prompt.
-    Uses a focused fix prompt instead of the full skill file.
-    The skill file is designed for CSV-based remediation workflows —
-    for direct code fixing, a compact prompt works better.
+    Uses language-specific skill based on project_info.
+    Combines with per-scan custom instructions from user (both are included, not overridden).
     """
-    return f"""You are a senior security engineer fixing vulnerabilities in production code.
+    # Build language-specific skill prompt based on detected project
+    from app.llm.skill_loader import build_language_skill
+    language_skill = ""
+    if project_info:
+        language_skill = build_language_skill(project_info)
+
+    # Combine: language-specific skill + user's extra instructions (both included)
+    instructions_parts = []
+    if language_skill.strip():
+        instructions_parts.append(language_skill.strip())
+    if extra_instructions.strip():
+        instructions_parts.append(f"USER INSTRUCTIONS:\n{extra_instructions.strip()}")
+
+    instructions = "\n\n".join(instructions_parts)
+
+    # If no project_info available, fall back to the generic skill file
+    if not instructions.strip():
+        from app.llm.skill_loader import load_skill
+        instructions = load_skill().strip()
+
+    base_prompt = """You are a senior security engineer fixing vulnerabilities in production code.
 
 RULES:
 - Return ONLY the complete fixed code
@@ -101,13 +120,23 @@ RULES:
 - If fixing XSS: use proper escaping/sanitization
 - If fixing hardcoded secrets: replace with environment variable with a dev fallback
 - If fixing command injection: use safe APIs, avoid shell=True
-- If fixing path traversal: validate and sanitize file paths
+- If fixing path traversal: validate and sanitize file paths"""
+
+    if instructions:
+        base_prompt += f"""
+
+ADDITIONAL INSTRUCTIONS:
+{instructions}"""
+
+    base_prompt += f"""
 
 VULNERABILITY:
 {issue}
 
 CODE TO FIX:
 {code}"""
+
+    return base_prompt
 
 
 def _strip_code_fences(text: str) -> str:

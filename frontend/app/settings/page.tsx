@@ -16,6 +16,11 @@ import {
   TestTube,
   Loader2,
   BrainCircuit,
+  FileText,
+  Plus,
+  Trash2,
+  ToggleLeft,
+  ToggleRight,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -26,6 +31,7 @@ import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = `${API_URL}/api/v1`;
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 export default function SettingsPage() {
@@ -67,7 +73,7 @@ export default function SettingsPage() {
 
   const fetchTokenStatus = async () => {
     try {
-      const res = await axios.get(`${API_URL}/settings/token/status`);
+      const res = await axios.get(`${API_BASE}/settings/token/status`);
       setTokenStatus(res.data);
     } catch {
       setTokenStatus(null);
@@ -76,7 +82,7 @@ export default function SettingsPage() {
 
   const fetchLLMStatus = async () => {
     try {
-      const res = await axios.get(`${API_URL}/environment`);
+      const res = await axios.get(`${API_BASE}/environment`);
       setLlmStatus(res.data.llm_providers);
     } catch {
       setLlmStatus(null);
@@ -106,7 +112,7 @@ export default function SettingsPage() {
         return;
       }
 
-      await axios.post(`${API_URL}/settings/llm/save`, { keys });
+      await axios.post(`${API_BASE}/settings/llm/save`, { keys });
 
       setAlert({
         type: "success",
@@ -147,7 +153,7 @@ export default function SettingsPage() {
     setAlert(null);
 
     try {
-      const res = await axios.post(`${API_URL}/settings/token/test`, {
+      const res = await axios.post(`${API_BASE}/settings/token/test`, {
         token: token.trim(),
         github_url: testRepoUrl.trim(),
       });
@@ -198,7 +204,7 @@ export default function SettingsPage() {
     setAlert(null);
 
     try {
-      await axios.post(`${API_URL}/settings/token/save`, {
+      await axios.post(`${API_BASE}/settings/token/save`, {
         token: token.trim(),
       });
 
@@ -749,7 +755,381 @@ Message: Hardcoded localhost URL found`}</pre>
             Open Schedules API →
           </a>
         </Card>
+
+        {/* Skills / LLM Prompt Management */}
+        <SkillsSection apiBase={API_BASE} />
+
+        {/* Custom Scan Rules */}
+        <CustomRulesSection apiBase={API_BASE} />
       </div>
     </main>
+  );
+}
+
+
+// =============================================================================
+// SKILLS MANAGEMENT COMPONENT
+// =============================================================================
+
+function SkillsSection({ apiBase }: { apiBase: string }) {
+  const [skillContent, setSkillContent] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [exists, setExists] = useState(false);
+
+  useEffect(() => {
+    fetchSkill();
+  }, []);
+
+  const fetchSkill = async () => {
+    setLoading(true);
+    try {
+      const res = await axios.get(`${apiBase}/settings/skill`);
+      setSkillContent(res.data.content || "");
+      setExists(res.data.exists);
+    } catch {
+      setSkillContent("");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveSkill = async () => {
+    setSaving(true);
+    try {
+      await axios.post(`${apiBase}/settings/skill`, { content: skillContent });
+      setExists(true);
+    } catch {
+      // handle error
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="p-5 rounded-2xl">
+      <div className="flex items-center gap-2 mb-4">
+        <FileText className="h-5 w-5 text-emerald-600" />
+        <h2 className="text-lg font-semibold">AI Skill Prompt</h2>
+      </div>
+      <p className="text-sm text-muted-foreground mb-4">
+        Customize the instructions given to the AI when generating fixes.
+        This is the &quot;system prompt&quot; that guides how the LLM remediates vulnerabilities.
+        You can add project-specific instructions, coding standards, or migration rules.
+      </p>
+
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground py-8 justify-center">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading skill prompt...
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs font-semibold">
+              vulnerability-remediation.md
+            </Label>
+            <Badge variant={exists ? "default" : "destructive"} className="text-[10px]">
+              {exists ? "Active" : "Not configured"}
+            </Badge>
+          </div>
+          <textarea
+            value={skillContent}
+            onChange={(e) => setSkillContent(e.target.value)}
+            placeholder={`# Vulnerability Remediation Skill\n\nYou are a senior security engineer...\n\n## Rules\n- Always use parameterized queries for SQL\n- Replace hardcoded secrets with environment variables\n- Use safe APIs instead of shell=True\n\n## Project-Specific Instructions\n- Our project uses Django 4.2\n- Database is PostgreSQL\n- Follow PEP 8 style`}
+            className="w-full h-64 rounded-lg border border-input bg-background px-3 py-2 text-sm font-mono resize-y focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+          />
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-muted-foreground">
+              {skillContent.length} characters • Markdown supported
+            </p>
+            <Button
+              onClick={saveSkill}
+              disabled={saving}
+              className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white"
+              size="sm"
+            >
+              {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3" />}
+              Save Skill Prompt
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+
+// =============================================================================
+// CUSTOM SCAN RULES COMPONENT
+// =============================================================================
+
+interface CustomRule {
+  id: number;
+  name: string;
+  description: string;
+  language: string;
+  severity: string;
+  pattern: string;
+  message: string;
+  enabled: number;
+  created_at: string;
+}
+
+function CustomRulesSection({ apiBase }: { apiBase: string }) {
+  const [rules, setRules] = useState<CustomRule[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+
+  // New rule form
+  const [newName, setNewName] = useState("");
+  const [newDescription, setNewDescription] = useState("");
+  const [newLanguage, setNewLanguage] = useState("python");
+  const [newSeverity, setNewSeverity] = useState("WARNING");
+  const [newPattern, setNewPattern] = useState("");
+  const [newMessage, setNewMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    fetchRules();
+  }, []);
+
+  const fetchRules = async () => {
+    setLoading(true);
+    try {
+      const res = await axios.get(`${apiBase}/rules`);
+      setRules(res.data.rules || []);
+    } catch {
+      setRules([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createRule = async () => {
+    if (!newName.trim() || !newPattern.trim() || !newMessage.trim()) return;
+    setSaving(true);
+    try {
+      await axios.post(`${apiBase}/rules`, {
+        name: newName.trim(),
+        description: newDescription.trim(),
+        language: newLanguage,
+        severity: newSeverity,
+        pattern: newPattern.trim(),
+        message: newMessage.trim(),
+      });
+      // Reset form
+      setNewName("");
+      setNewDescription("");
+      setNewPattern("");
+      setNewMessage("");
+      setShowForm(false);
+      fetchRules();
+    } catch {
+      // handle error
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteRule = async (id: number) => {
+    try {
+      await axios.delete(`${apiBase}/rules/${id}`);
+      fetchRules();
+    } catch {
+      // handle error
+    }
+  };
+
+  const toggleRule = async (id: number, enabled: boolean) => {
+    try {
+      await axios.patch(`${apiBase}/rules/${id}`, { enabled });
+      fetchRules();
+    } catch {
+      // handle error
+    }
+  };
+
+  return (
+    <Card className="p-5 rounded-2xl">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Shield className="h-5 w-5 text-orange-600" />
+          <h2 className="text-lg font-semibold">Custom Scan Rules</h2>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="gap-1 text-xs"
+          onClick={() => setShowForm(!showForm)}
+        >
+          <Plus className="h-3 w-3" />
+          {showForm ? "Cancel" : "Add Rule"}
+        </Button>
+      </div>
+      <p className="text-sm text-muted-foreground mb-4">
+        Create custom Semgrep rules to detect patterns specific to your codebase.
+        Rules run alongside the default security scans.
+      </p>
+
+      {/* Create Rule Form */}
+      {showForm && (
+        <div className="rounded-lg border p-4 space-y-3 mb-4 bg-muted/30">
+          <p className="text-xs font-semibold">New Custom Rule</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label className="text-xs">Rule Name</Label>
+              <Input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="e.g. No hardcoded localhost"
+                className="text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Description (optional)</Label>
+              <Input
+                value={newDescription}
+                onChange={(e) => setNewDescription(e.target.value)}
+                placeholder="What this rule detects"
+                className="text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Language</Label>
+              <select
+                value={newLanguage}
+                onChange={(e) => setNewLanguage(e.target.value)}
+                className="w-full h-8 rounded-md border border-input bg-background px-2.5 text-xs"
+              >
+                <option value="python">Python</option>
+                <option value="javascript">JavaScript</option>
+                <option value="typescript">TypeScript</option>
+                <option value="java">Java</option>
+                <option value="go">Go</option>
+                <option value="ruby">Ruby</option>
+                <option value="php">PHP</option>
+                <option value="csharp">C#</option>
+              </select>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Severity</Label>
+              <select
+                value={newSeverity}
+                onChange={(e) => setNewSeverity(e.target.value)}
+                className="w-full h-8 rounded-md border border-input bg-background px-2.5 text-xs"
+              >
+                <option value="ERROR">ERROR (Critical)</option>
+                <option value="WARNING">WARNING (Medium)</option>
+                <option value="INFO">INFO (Low)</option>
+              </select>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs">Semgrep Pattern</Label>
+            <textarea
+              value={newPattern}
+              onChange={(e) => setNewPattern(e.target.value)}
+              placeholder={'requests.get("http://localhost:...")'}
+              className="w-full h-20 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-mono resize-y"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              Use Semgrep pattern syntax. &quot;...&quot; matches any expression.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs">Alert Message</Label>
+            <Input
+              value={newMessage}
+              onChange={(e) => setNewMessage(e.target.value)}
+              placeholder="Hardcoded localhost URL found — use environment variable"
+              className="text-xs"
+            />
+          </div>
+          <Button
+            onClick={createRule}
+            disabled={saving || !newName.trim() || !newPattern.trim() || !newMessage.trim()}
+            size="sm"
+            className="gap-1 bg-orange-600 hover:bg-orange-700 text-white"
+          >
+            {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
+            Create Rule
+          </Button>
+        </div>
+      )}
+
+      {/* Rules List */}
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground py-4 justify-center">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading rules...
+        </div>
+      ) : rules.length > 0 ? (
+        <div className="rounded-lg border overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-muted">
+              <tr>
+                <th className="text-left p-2 font-semibold">Rule</th>
+                <th className="text-center p-2 font-semibold">Language</th>
+                <th className="text-center p-2 font-semibold">Severity</th>
+                <th className="text-center p-2 font-semibold">Status</th>
+                <th className="text-center p-2 font-semibold">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rules.map((rule) => (
+                <tr key={rule.id} className="border-t">
+                  <td className="p-2">
+                    <p className="font-medium">{rule.name}</p>
+                    {rule.description && (
+                      <p className="text-muted-foreground text-[10px]">{rule.description}</p>
+                    )}
+                  </td>
+                  <td className="p-2 text-center">
+                    <Badge variant="outline" className="text-[10px]">{rule.language}</Badge>
+                  </td>
+                  <td className="p-2 text-center">
+                    <Badge className={`text-[10px] ${
+                      rule.severity === "ERROR" ? "bg-red-600 text-white" :
+                      rule.severity === "WARNING" ? "bg-yellow-500 text-black" :
+                      "bg-blue-500 text-white"
+                    }`}>
+                      {rule.severity}
+                    </Badge>
+                  </td>
+                  <td className="p-2 text-center">
+                    <button
+                      onClick={() => toggleRule(rule.id, !rule.enabled)}
+                      className="text-xs"
+                      title={rule.enabled ? "Disable rule" : "Enable rule"}
+                    >
+                      {rule.enabled ? (
+                        <ToggleRight className="h-5 w-5 text-green-600" />
+                      ) : (
+                        <ToggleLeft className="h-5 w-5 text-slate-400" />
+                      )}
+                    </button>
+                  </td>
+                  <td className="p-2 text-center">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => deleteRule(rule.id)}
+                      className="h-6 w-6 p-0 text-red-500 hover:text-red-700"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground text-center py-6 border-2 border-dashed rounded-lg">
+          No custom rules configured. Click &quot;Add Rule&quot; to create your first custom scan rule.
+        </p>
+      )}
+    </Card>
   );
 }

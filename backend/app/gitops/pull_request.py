@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 def create_pr(
     repo_name: str,
     branch_name: str,
-    default_branch: str = "main",
+    default_branch: str = "",
     fixed_files: Optional[List[Dict[str, Any]]] = None,
     findings: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
@@ -30,7 +30,7 @@ def create_pr(
     Args:
         repo_name: "owner/repo"
         branch_name: branch with fixes
-        default_branch: target branch
+        default_branch: target branch (empty = auto-detect from repo)
         fixed_files: list of {"path", "findings_fixed", "confidence", "diff"}
         findings: original findings that were fixed
     """
@@ -43,6 +43,7 @@ def create_pr(
     g = Github(token)
     repo = g.get_repo(repo_name)
 
+    # Use repo's actual default branch (main, master, develop, etc.)
     base_branch = default_branch or repo.default_branch
     logger.info(f"Creating PR: {branch_name} -> {base_branch} on {repo_name}")
 

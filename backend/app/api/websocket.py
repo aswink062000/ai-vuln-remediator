@@ -173,6 +173,7 @@ async def websocket_scan(websocket: WebSocket):
     await websocket.accept()
 
     session_id = None
+    root_logger = logging.getLogger("app")
 
     try:
         # Wait for the scan request from client
@@ -200,7 +201,6 @@ async def websocket_scan(websocket: WebSocket):
         log_handler.setFormatter(logging.Formatter("%(message)s"))
 
         # Attach to root logger to capture all app.* logs
-        root_logger = logging.getLogger("app")
         root_logger.addHandler(log_handler)
 
         # Send initial acknowledgment
@@ -257,7 +257,6 @@ async def websocket_scan(websocket: WebSocket):
         # Cleanup
         if session_id:
             # Remove log handler
-            root_logger = logging.getLogger("app")
             for handler in root_logger.handlers[:]:
                 if isinstance(handler, WebSocketLogHandler) and handler.session_id == session_id:
                     root_logger.removeHandler(handler)

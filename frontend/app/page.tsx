@@ -27,6 +27,9 @@ import {
   Monitor,
   Package,
   BarChart3,
+  GitBranch as GitBranchIcon,
+  Check,
+  AlertCircle,
 } from "lucide-react";
 
 import { useTheme } from "next-themes";
@@ -45,6 +48,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { ReviewPanel } from "@/components/diff-viewer/ReviewPanel";
 
 type ScanMode = "scan-fix" | "scan-only";
 type LogEntry = {
@@ -56,6 +60,7 @@ type LogEntry = {
 };
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = `${API_URL}/api/v1`;
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
@@ -70,10 +75,22 @@ export default function Home() {
   const [url, setUrl] = useState("");
   const [result, setResult] = useState<any>(null);
   const [scanMode, setScanMode] = useState<ScanMode>("scan-only");
+  const [branch, setBranch] = useState("");  // Branch to scan
+  const [branches, setBranches] = useState<string[]>([]);  // Available branches
+  const [defaultBranch, setDefaultBranch] = useState("");  // Repo's default branch
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [prBranchName, setPrBranchName] = useState("");  // Custom PR branch name
+  const [skillPrompt, setSkillPrompt] = useState("");  // Per-scan AI instructions
+  const [showAdvanced, setShowAdvanced] = useState(false);  // Toggle advanced options
 
   const [scanHistory, setScanHistory] = useState<any[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // Review panel state (for scan-fix-preview mode)
+  const [showReview, setShowReview] = useState(false);
+  const [previewFiles, setPreviewFiles] = useState<any[]>([]);
+  const [applyingFixes, setApplyingFixes] = useState(false);
 
   // Terminal / WebSocket state
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -84,6 +101,16 @@ export default function Home() {
   const [reportView, setReportView] = useState<"report" | "json">("report");
   const terminalRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const loadingRef = useRef(false);
+
+  // Prerequisites state
+  const [prereqsReady, setPrereqsReady] = useState(false);
+  const [prereqsLoading, setPrereqsLoading] = useState(true);
+  const [prereqStatus, setPrereqStatus] = useState<any>(null);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
 
   useEffect(() => {
     setMounted(true);
@@ -91,7 +118,27 @@ export default function Home() {
     if (API_KEY) {
       axios.defaults.headers.common["X-API-Key"] = API_KEY;
     }
+    // Check prerequisites on load
+    checkPrerequisites();
   }, []);
+
+  const checkPrerequisites = async () => {
+    setPrereqsLoading(true);
+    try {
+      const res = await axios.get(`${API_URL}/health/prerequisites`);
+      setPrereqStatus(res.data);
+      // Ready if git + sast scanner are installed
+      const gitOk = res.data?.git?.installed;
+      const sastOk = res.data?.sast_scanner?.installed;
+      setPrereqsReady(gitOk && sastOk);
+    } catch {
+      // Backend not running — disable scan buttons
+      setPrereqsReady(false);
+      setPrereqStatus(null);
+    } finally {
+      setPrereqsLoading(false);
+    }
+  };
 
   useEffect(() => {
     const savedHistory = sessionStorage.getItem("scanHistory");
@@ -106,6 +153,56 @@ export default function Home() {
       terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
     }
   }, [logs]);
+
+  // Auto-detect branch from URL and fetch available branches
+  useEffect(() => {
+    if (!url) {
+      setBranches([]);
+      setDefaultBranch("");
+      return;
+    }
+
+    // Extract branch from /tree/branch-name URLs
+    const treeMatch = url.match(/github\.com\/[^/]+\/[^/]+\/tree\/([^/?#]+)/);
+    if (treeMatch) {
+      setBranch(treeMatch[1]);
+      const cleanUrl = url.replace(/\/tree\/[^/?#]+/, "");
+      setUrl(cleanUrl);
+      setShowAdvanced(true);
+      return; // Will re-trigger with clean URL
+    }
+
+    // Only fetch branches for valid GitHub URLs
+    if (!url.startsWith("https://github.com/") || url.split("/").filter(Boolean).length < 4) {
+      return;
+    }
+
+    // Debounce: fetch branches after user stops typing
+    const timer = setTimeout(() => {
+      fetchBranches(url);
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [url]);
+
+  const fetchBranches = async (repoUrl: string) => {
+    setBranchesLoading(true);
+    try {
+      const res = await axios.post(`${API_BASE}/branches`, { github_url: repoUrl });
+      setBranches(res.data.branches || []);
+      setDefaultBranch(res.data.default_branch || "");
+      // Pre-select default branch if none selected
+      if (!branch) {
+        setBranch(res.data.default_branch || "");
+      }
+    } catch {
+      // Token might not be set or repo doesn't exist — just clear
+      setBranches([]);
+      setDefaultBranch("");
+    } finally {
+      setBranchesLoading(false);
+    }
+  };
 
   const addLog = useCallback((entry: LogEntry) => {
     const timestamped = { ...entry, timestamp: new Date().toLocaleTimeString() };
@@ -124,12 +221,21 @@ export default function Home() {
     setErrorMessage("");
     setShowError(false);
     setResult(null);
+    setShowReview(false);
+    setPreviewFiles([]);
     setLogs([]);
     setShowTerminal(true);
     setCurrentPhase("Connecting...");
     setMissingSDKs([]);
     setShowInstallPrompt(false);
 
+    // For "Scan & Fix" mode — always use HTTP with preview (review before PR)
+    if (scanMode === "scan-fix") {
+      runScanFixPreview();
+      return;
+    }
+
+    // For "Scan Only" mode — use WebSocket for real-time progress
     const wsUrl = `${WS_URL}/ws/scan`;
 
     try {
@@ -138,7 +244,11 @@ export default function Home() {
 
       ws.onopen = () => {
         addLog({ type: "log", message: "Connected to server", level: "info" });
-        ws.send(JSON.stringify({ github_url: url, mode: scanMode }));
+        ws.send(JSON.stringify({
+          github_url: url,
+          mode: "scan-only",
+          branch,
+        }));
       };
 
       ws.onmessage = (event) => {
@@ -171,9 +281,11 @@ export default function Home() {
                   timestamp: new Date().toISOString(),
                   result: msg.data,
                 };
-                const updated = [historyEntry, ...scanHistory].slice(0, 10);
-                setScanHistory(updated);
-                sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+                setScanHistory((prev) => {
+                  const updated = [historyEntry, ...prev].slice(0, 10);
+                  sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+                  return updated;
+                });
               }
               break;
             case "error":
@@ -193,7 +305,7 @@ export default function Home() {
       };
 
       ws.onclose = () => {
-        if (loading) {
+        if (loadingRef.current) {
           setLoading(false);
         }
       };
@@ -203,19 +315,111 @@ export default function Home() {
     }
   }
 
-  // HTTP fallback (original behavior)
+  // Scan & Fix with Preview (starts background task, polls for progress)
+  async function runScanFixPreview() {
+    addLog({ type: "phase", message: "Starting scan & fix..." });
+    setCurrentPhase("Starting...");
+
+    try {
+      // Start the background task
+      const res = await axios.post(`${API_BASE}/scan-fix-preview`, {
+        github_url: url,
+        branch,
+        skill_prompt: skillPrompt,
+      });
+
+      const taskId = res.data.task_id;
+      if (!taskId) {
+        // Fallback: result returned directly (shouldn't happen with new API)
+        setResult(res.data);
+        setLoading(false);
+        return;
+      }
+
+      addLog({ type: "log", message: `Task started: ${taskId}`, level: "info" });
+
+      // Poll for progress
+      let completed = false;
+      while (!completed) {
+        await new Promise((resolve) => setTimeout(resolve, 1000)); // Poll every 1s
+
+        try {
+          const progressRes = await axios.get(`${API_BASE}/progress/${taskId}`);
+          const progress = progressRes.data;
+
+          if (progress.phase) {
+            setCurrentPhase(progress.phase);
+          }
+
+          // Show new log messages
+          if (progress.logs && progress.logs.length > 0) {
+            const lastLog = progress.logs[progress.logs.length - 1];
+            if (lastLog.message) {
+              addLog({ type: "log", message: lastLog.message, level: "info" });
+            }
+          }
+
+          // Check if complete
+          if (progress.status === "complete" || progress.status === "error") {
+            completed = true;
+
+            if (progress.result) {
+              setResult(progress.result);
+
+              // Show review panel if fixes were generated
+              if (progress.result.status === "preview_ready" && progress.result.preview_files?.length > 0) {
+                setPreviewFiles(progress.result.preview_files);
+                setShowReview(true);
+                setShowTerminal(false);
+                addLog({ type: "phase", message: "Fixes ready for review!" });
+              } else {
+                addLog({ type: "phase", message: progress.result.message || "Complete" });
+              }
+
+              // Save to history
+              setScanHistory((prev) => {
+                const historyEntry = {
+                  url,
+                  mode: scanMode,
+                  timestamp: new Date().toISOString(),
+                  result: progress.result,
+                };
+                const updated = [historyEntry, ...prev].slice(0, 10);
+                sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+                return updated;
+              });
+            }
+
+            if (progress.status === "error") {
+              setErrorMessage(progress.result?.message || "Scan failed");
+              setShowError(true);
+            }
+          }
+        } catch {
+          // Polling failed — might be network issue, keep trying
+        }
+      }
+    } catch (error: any) {
+      const msg = error.response?.data?.message || error.response?.data?.detail || error.message || "Failed to start scan";
+      setErrorMessage(msg);
+      setShowError(true);
+      addLog({ type: "error", message: msg });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // HTTP fallback (for scan-only when WebSocket fails)
   async function runScanHTTP() {
     setShowTerminal(true);
     addLog({ type: "log", message: "Using HTTP fallback mode", level: "info" });
     setCurrentPhase("Scanning (HTTP mode)...");
 
-    const endpoint =
-      scanMode === "scan-fix"
-        ? `${API_URL}/scan`
-        : `${API_URL}/scan-only`;
-
     try {
-      const res = await axios.post(endpoint, { github_url: url });
+      const res = await axios.post(`${API_BASE}/scan-only`, {
+        github_url: url,
+        branch,
+      });
       setResult(res.data);
       addLog({ type: "phase", message: "Scan complete!" });
       setCurrentPhase("Complete");
@@ -226,11 +430,13 @@ export default function Home() {
         timestamp: new Date().toISOString(),
         result: res.data,
       };
-      const updatedHistory = [historyEntry, ...scanHistory].slice(0, 10);
-      setScanHistory(updatedHistory);
-      sessionStorage.setItem("scanHistory", JSON.stringify(updatedHistory));
+      setScanHistory((prev) => {
+        const updatedHistory = [historyEntry, ...prev].slice(0, 10);
+        sessionStorage.setItem("scanHistory", JSON.stringify(updatedHistory));
+        return updatedHistory;
+      });
     } catch (error: any) {
-      const msg = error.response?.data?.detail || error.message || "Failed to scan";
+      const msg = error.response?.data?.message || error.response?.data?.detail || error.message || "Failed to scan";
       setErrorMessage(msg);
       setShowError(true);
       addLog({ type: "error", message: msg });
@@ -265,7 +471,7 @@ export default function Home() {
     if (!result) return;
     try {
       const res = await axios.post(
-        `${API_URL}/report/pdf`,
+        `${API_BASE}/report/pdf`,
         { scan_data: result },
         { responseType: "blob" }
       );
@@ -288,7 +494,7 @@ export default function Home() {
     if (!result) return;
     try {
       const res = await axios.post(
-        `${API_URL}/export/sarif`,
+        `${API_BASE}/export/sarif`,
         { scan_data: result },
         { responseType: "blob" }
       );
@@ -311,7 +517,7 @@ export default function Home() {
     if (!result) return;
     try {
       const res = await axios.post(
-        `${API_URL}/export/csv`,
+        `${API_BASE}/export/csv`,
         { scan_data: result },
         { responseType: "blob" }
       );
@@ -341,7 +547,7 @@ export default function Home() {
   const clearHistory = async () => {
     // Clear from backend
     try {
-      await axios.delete(`${API_URL}/history`);
+      await axios.delete(`${API_BASE}/history`);
     } catch {
       // Backend might not have history yet, that's fine
     }
@@ -353,7 +559,7 @@ export default function Home() {
 
   const suppressFinding = async (ruleId: string, path: string) => {
     try {
-      await axios.post(`${API_URL}/baseline/suppress`, {
+      await axios.post(`${API_BASE}/baseline/suppress`, {
         rule_id: ruleId,
         path: path || "",
         reason: "accepted_risk",
@@ -370,6 +576,62 @@ export default function Home() {
       }
     } catch {
       // silently fail
+    }
+  };
+
+  const handleApplyFixes = async (approvedFiles: Array<{ path: string; fixed_code: string }>) => {
+    console.log("[handleApplyFixes] Received approved files:", approvedFiles.map(f => f.path));
+    console.log("[handleApplyFixes] Total files:", approvedFiles.length);
+    setApplyingFixes(true);
+    try {
+      const res = await axios.post(`${API_BASE}/apply-fixes`, {
+        github_url: url,
+        branch,
+        pr_branch_name: prBranchName,
+        approved_files: approvedFiles,
+      });
+
+      // Map the response to match what the UI expects
+      const resultData = {
+        ...res.data,
+        // Map pr_url → pull_request (what the UI renders)
+        pull_request: res.data.pr_url || res.data.pull_request || null,
+        repo: url,
+        total_findings: result?.total_findings || 0,
+        fixable_findings: result?.fixable_findings || 0,
+        scan_summary: result?.scan_summary || {},
+        findings_breakdown: result?.findings_breakdown || {},
+        project_info: result?.project_info || {},
+        files_fixed: approvedFiles.map((f) => ({
+          path: f.path,
+          findings_fixed: 1,
+          confidence: -1,
+        })),
+      };
+
+      setResult(resultData);
+      setShowReview(false);
+      setPreviewFiles([]);
+      setShowTerminal(false);
+
+      if (res.data.status === "success") {
+        addLog({ type: "phase", message: `✓ PR created with ${res.data.files_count || approvedFiles.length} approved fixes!` });
+        // Warn if any files were skipped by the safety check
+        if (res.data.skipped_files && res.data.skipped_files.length > 0) {
+          const skippedPaths = res.data.skipped_files.map((f: any) => f.path).join(", ");
+          addLog({ type: "log", message: `⚠️ ${res.data.skipped_files.length} file(s) skipped by secret safety check: ${skippedPaths}`, level: "warning" });
+        }
+        setCurrentPhase("PR Created");
+      } else {
+        setErrorMessage(res.data.message || "Failed to apply fixes");
+        setShowError(true);
+      }
+    } catch (error: any) {
+      const msg = error.response?.data?.message || error.response?.data?.detail || error.message || "Failed to apply fixes";
+      setErrorMessage(msg);
+      setShowError(true);
+    } finally {
+      setApplyingFixes(false);
     }
   };
 
@@ -668,51 +930,166 @@ export default function Home() {
         )}
 
         {result.pull_request && (
-          <div className="rounded-lg bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 p-4">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-green-600" />
-              <div>
-                <p className="font-semibold text-sm">Pull Request Created</p>
-                <a href={result.pull_request} target="_blank" rel="noopener noreferrer"
-                  className="text-xs text-blue-600 hover:underline flex items-center gap-1">
-                  {result.pull_request}<ExternalLink className="h-3 w-3" />
-                </a>
+          <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
+            {/* Report Header */}
+            <div className="bg-slate-800 dark:bg-slate-900 text-white px-5 py-4">
+              <h2 className="text-base font-bold tracking-wide">VULNERABILITY SCAN REPORT</h2>
+              <p className="text-[10px] text-slate-300 mt-0.5">AI Vulnerability Remediator • Automated Security Analysis</p>
+            </div>
+
+            {/* Executive Summary */}
+            <div className="px-5 py-4 border-b">
+              <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider mb-3 border-b-2 border-blue-600 pb-1 inline-block">Executive Summary</h3>
+              <div className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-xs">
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Target Repository:</span>
+                <span className="font-mono text-slate-600 dark:text-slate-400">{result.repo || ""}</span>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Scan Status:</span>
+                <span className="font-semibold text-green-600">SUCCESS</span>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Total Vulnerabilities:</span>
+                <span className="font-bold">{result.total_findings || 0}</span>
+                {result.project_info?.languages && (
+                  <>
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">Languages Detected:</span>
+                    <span>{result.project_info.languages.join(", ")}</span>
+                  </>
+                )}
+                {result.project_info?.frameworks && result.project_info.frameworks.length > 0 && (
+                  <>
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">Frameworks:</span>
+                    <span>{result.project_info.frameworks.join(", ")}</span>
+                  </>
+                )}
               </div>
             </div>
-            {/* Fix Confidence */}
-            {result.files_fixed && result.files_fixed.some((f: any) => f.confidence >= 0) && (
-              <div className="mt-3 pt-3 border-t border-green-200 dark:border-green-800">
-                <p className="text-xs font-semibold text-muted-foreground mb-2">Fix Confidence</p>
-                <div className="space-y-1">
-                  {result.files_fixed.filter((f: any) => f.confidence >= 0).map((f: any, idx: number) => (
-                    <div key={idx} className="flex items-center gap-2 text-xs">
-                      <div className="flex-1 min-w-0">
-                        <span className="truncate text-muted-foreground">{f.path}</span>
-                      </div>
-                      <div className="flex items-center gap-1">
-                        <div className="w-16 h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full rounded-full ${
-                              f.confidence >= 90 ? "bg-green-500" :
-                              f.confidence >= 70 ? "bg-blue-500" :
-                              f.confidence >= 50 ? "bg-yellow-500" : "bg-red-500"
-                            }`}
-                            style={{ width: `${Math.max(f.confidence, 5)}%` }}
-                          />
+
+            {/* Risk Overview Table */}
+            {result.scan_summary?.by_severity && Object.keys(result.scan_summary.by_severity).length > 0 && (
+              <div className="px-5 py-4 border-b">
+                <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider mb-3 border-b-2 border-blue-600 pb-1 inline-block">Risk Overview</h3>
+                <div className="border rounded overflow-hidden text-xs">
+                  {/* Table Header */}
+                  <div className="grid grid-cols-3 bg-slate-100 dark:bg-slate-800 font-bold text-slate-700 dark:text-slate-300">
+                    <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700">SEVERITY</div>
+                    <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700 text-center">COUNT</div>
+                    <div className="px-3 py-2 text-center">RISK LEVEL</div>
+                  </div>
+                  {/* Table Rows */}
+                  {[
+                    { key: "CRITICAL", color: "bg-red-600", label: "Immediate action required" },
+                    { key: "HIGH", color: "bg-orange-500", label: "High priority fix needed" },
+                    { key: "ERROR", color: "bg-orange-400", label: "High priority fix needed" },
+                    { key: "MEDIUM", color: "bg-yellow-500", label: "Should be addressed" },
+                    { key: "WARNING", color: "bg-yellow-400", label: "Should be addressed" },
+                    { key: "MODERATE", color: "bg-yellow-400", label: "Should be addressed" },
+                    { key: "LOW", color: "bg-green-500", label: "Low priority" },
+                    { key: "INFO", color: "bg-blue-400", label: "Informational" },
+                  ]
+                    .filter(({ key }) => (result.scan_summary.by_severity[key] || 0) > 0)
+                    .map(({ key, color, label }) => (
+                      <div key={key} className="grid grid-cols-3 border-t border-slate-200 dark:border-slate-700">
+                        <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700 flex items-center gap-2">
+                          <span className={`w-3 h-3 rounded-sm ${color}`} />
+                          <span className="font-bold">{key}</span>
                         </div>
-                        <span className={`font-mono ${
-                          f.confidence >= 90 ? "text-green-600" :
-                          f.confidence >= 70 ? "text-blue-600" :
-                          f.confidence >= 50 ? "text-yellow-600" : "text-red-600"
-                        }`}>
-                          {f.confidence}%
-                        </span>
+                        <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700 text-center font-mono font-bold">
+                          {result.scan_summary.by_severity[key] || 0}
+                        </div>
+                        <div className="px-3 py-2 text-center text-muted-foreground">{label}</div>
                       </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {/* Scanner Coverage */}
+            {result.scan_summary?.by_scanner && Object.keys(result.scan_summary.by_scanner).length > 0 && (
+              <div className="px-5 py-4 border-b">
+                <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider mb-3 border-b-2 border-blue-600 pb-1 inline-block">Scanner Coverage</h3>
+                <div className="space-y-1.5 text-xs pl-4">
+                  {Object.entries(result.scan_summary.by_scanner)
+                    .sort(([, a]: any, [, b]: any) => b - a)
+                    .map(([scanner, count]: [string, any]) => (
+                      <div key={scanner} className="text-slate-700 dark:text-slate-300">
+                        {scanner}: <span className="font-bold">{count}</span> finding(s)
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {/* Remediation Applied */}
+            {result.files_fixed && result.files_fixed.length > 0 && (
+              <div className="px-5 py-4 border-b">
+                <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider mb-3 border-b-2 border-green-600 pb-1 inline-block">Remediation Applied</h3>
+
+                {/* PR Info */}
+                <div className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-xs mb-4">
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">Pull Request:</span>
+                  <a href={result.pull_request} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline font-mono truncate">
+                    {result.pull_request}
+                  </a>
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">Files Modified:</span>
+                  <span className="font-bold">{result.files_fixed.length}</span>
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">Total Issues Resolved:</span>
+                  <span className="font-bold">{result.files_fixed.reduce((sum: number, f: any) => sum + (f.findings_fixed || 1), 0)}</span>
+                </div>
+
+                {/* Fixed Files Table */}
+                <div className="border rounded overflow-hidden text-xs">
+                  {/* Table Header */}
+                  <div className="grid grid-cols-[2rem_1fr_auto_1fr] bg-slate-800 dark:bg-slate-900 text-white font-bold">
+                    <div className="px-2 py-2 text-center">#</div>
+                    <div className="px-3 py-2">Issue Found</div>
+                    <div className="px-3 py-2 text-center">Status</div>
+                    <div className="px-3 py-2">File</div>
+                  </div>
+                  {/* Table Rows */}
+                  {result.files_fixed.map((f: any, idx: number) => (
+                    <div key={idx} className={`grid grid-cols-[2rem_1fr_auto_1fr] border-t border-slate-200 dark:border-slate-700 ${
+                      idx % 2 === 0 ? "bg-white dark:bg-slate-900" : "bg-slate-50 dark:bg-slate-800/50"
+                    }`}>
+                      <div className="px-2 py-2 text-center text-muted-foreground">{idx + 1}</div>
+                      <div className="px-3 py-2">{f.findings_fixed || 1} vulnerability(s)</div>
+                      <div className="px-3 py-2 text-center">
+                        <span className="text-green-600 dark:text-green-400 italic text-[11px]">Fixed by AI Remediator</span>
+                      </div>
+                      <div className="px-3 py-2 font-mono text-muted-foreground truncate">{f.path}</div>
                     </div>
                   ))}
                 </div>
               </div>
             )}
+
+            {/* Skipped Files */}
+            {result.skipped_files && result.skipped_files.length > 0 && (
+              <div className="px-5 py-4 border-b">
+                <h3 className="text-xs font-bold text-orange-700 dark:text-orange-400 uppercase tracking-wider mb-2">⚠️ Skipped Files ({result.skipped_files.length})</h3>
+                <div className="space-y-1 text-xs pl-4">
+                  {result.skipped_files.map((f: any, idx: number) => (
+                    <div key={idx} className="text-muted-foreground">
+                      <span className="font-mono">{f.path}</span> — <span className="text-orange-600 dark:text-orange-400">{f.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Footer — View PR */}
+            <div className="px-5 py-3 bg-slate-50 dark:bg-slate-800/50 flex items-center justify-between">
+              <p className="text-[10px] text-muted-foreground">
+                Generated by AI Vulnerability Remediator
+              </p>
+              <a
+                href={result.pull_request}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+              >
+                <GitBranchIcon className="h-3 w-3" />
+                View PR on GitHub
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
           </div>
         )}
 
@@ -1074,12 +1451,156 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {/* Advanced Options (Branch, PR name, Instructions) */}
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowAdvanced(!showAdvanced)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <Settings className="h-3 w-3" />
+                      {showAdvanced ? "Hide" : "Show"} Advanced Options
+                      <span className="text-[10px]">{showAdvanced ? "▲" : "▼"}</span>
+                    </button>
+
+                    {showAdvanced && (
+                      <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-3 bg-muted/30">
+                        {/* Branch to scan */}
+                        <div className="space-y-1">
+                          <Label className="text-xs">Branch to Scan</Label>
+                          {branches.length > 0 ? (
+                            <select
+                              value={branch}
+                              onChange={(e) => setBranch(e.target.value)}
+                              className="w-full h-8 rounded-lg border border-input bg-background px-2.5 text-xs"
+                            >
+                              {branches.map((b) => (
+                                <option key={b} value={b}>
+                                  {b}{b === defaultBranch ? " (default)" : ""}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <div className="relative">
+                              <Input
+                                value={branch}
+                                onChange={(e) => setBranch(e.target.value)}
+                                placeholder={branchesLoading ? "Loading branches..." : "main (leave empty for default)"}
+                                className="text-xs h-8"
+                                disabled={branchesLoading}
+                              />
+                              {branchesLoading && (
+                                <div className="absolute right-2 top-1/2 -translate-y-1/2">
+                                  <SearchCode className="h-3 w-3 animate-spin text-muted-foreground" />
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          <p className="text-[10px] text-muted-foreground">
+                            {branches.length > 0
+                              ? `${branches.length} branches found. Default: ${defaultBranch}`
+                              : "Enter a valid GitHub URL to auto-load branches, or type a branch name."}
+                          </p>
+                        </div>
+
+                        {/* PR Branch Name (only for scan-fix) */}
+                        {scanMode === "scan-fix" && (
+                          <div className="space-y-1">
+                            <Label className="text-xs">PR Branch Name</Label>
+                            <Input
+                              value={prBranchName}
+                              onChange={(e) => setPrBranchName(e.target.value)}
+                              placeholder="fix/vuln-remediation-abc123 (auto-generated if empty)"
+                              className="text-xs h-8 font-mono"
+                            />
+                            <p className="text-[10px] text-muted-foreground">
+                              Custom name for the fix branch. Leave empty for auto-generated name.
+                            </p>
+                          </div>
+                        )}
+
+                        {/* Per-scan skill instructions */}
+                        <div className="space-y-1">
+                          <Label className="text-xs">Additional AI Instructions</Label>
+                          <textarea
+                            value={skillPrompt}
+                            onChange={(e) => setSkillPrompt(e.target.value)}
+                            placeholder={"e.g.\n- Use Django 4.2 patterns\n- Database is PostgreSQL\n- Follow our coding standards at docs/STYLE.md\n- Replace deprecated APIs with new equivalents"}
+                            className="w-full h-24 rounded-lg border border-input bg-background px-2.5 py-1.5 text-xs resize-y focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                          />
+                          <p className="text-[10px] text-muted-foreground">
+                            Custom instructions for the AI when generating fixes. Project-specific rules, coding standards, migration notes.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                   <Button className={`w-full h-10 lg:h-11 gap-2 text-sm lg:text-base text-white ${
                     scanMode === "scan-fix" ? "bg-green-600 hover:bg-green-700" : "bg-blue-600 hover:bg-blue-700"
-                  }`} onClick={runScan} disabled={loading}>
+                  }`} onClick={runScan} disabled={loading || !prereqsReady}>
                     {loading ? <SearchCode className="h-4 w-4 animate-pulse" /> : scanMode === "scan-fix" ? <Wrench className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                     {loading ? "Analyzing Repository..." : scanMode === "scan-fix" ? "Scan & Fix Repository" : "Scan Repository"}
                   </Button>
+
+                  {/* Prerequisites Warning */}
+                  {!prereqsLoading && !prereqsReady && (
+                    <div className="rounded-lg bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 p-3 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 text-red-600" />
+                        <p className="text-xs font-semibold text-red-700 dark:text-red-300">
+                          {prereqStatus === null ? "Backend not running" : "Missing required tools"}
+                        </p>
+                      </div>
+                      {prereqStatus === null ? (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          Cannot connect to the backend server at {API_URL}. Start the backend first.
+                        </p>
+                      ) : (
+                        <div className="space-y-1 text-xs">
+                          {!prereqStatus?.git?.installed && (
+                            <div className="flex items-center gap-2">
+                              <XCircle className="h-3 w-3 text-red-500" />
+                              <span>Git not installed — </span>
+                              <code className="bg-red-100 dark:bg-red-900 px-1 rounded text-[10px]">
+                                {navigator.platform?.includes("Mac") ? "brew install git" : "sudo apt install git"}
+                              </code>
+                            </div>
+                          )}
+                          {!prereqStatus?.sast_scanner?.installed && (
+                            <div className="flex items-center gap-2">
+                              <XCircle className="h-3 w-3 text-red-500" />
+                              <span>SAST Scanner not installed — </span>
+                              <code className="bg-red-100 dark:bg-red-900 px-1 rounded text-[10px]">
+                                curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
+                              </code>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <Button variant="outline" size="sm" className="text-xs gap-1 mt-1" onClick={checkPrerequisites}>
+                        <SearchCode className="h-3 w-3" /> Re-check
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Prerequisites OK indicator */}
+                  {!prereqsLoading && prereqsReady && prereqStatus && (
+                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                      <CheckCircle2 className="h-3 w-3 text-green-500" />
+                      <span>
+                        {prereqStatus.sast_scanner?.tool === "opengrep" ? "OpenGrep" : "Semgrep"} ready
+                      </span>
+                      <span className="text-slate-300 dark:text-slate-600">•</span>
+                      <span>Git ready</span>
+                      {prereqStatus.sast_scanner?.tool && (
+                        <>
+                          <span className="text-slate-300 dark:text-slate-600">•</span>
+                          <span className="font-mono">{prereqStatus.sast_scanner.tool}</span>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </Card>
 
@@ -1242,7 +1763,15 @@ export default function Home() {
               </div>
 
               <div className="flex-1 overflow-auto p-4 lg:p-6">
-                {loading && !result ? (
+                {/* Review Panel — shown when fixes are ready for approval */}
+                {showReview && previewFiles.length > 0 ? (
+                  <ReviewPanel
+                    files={previewFiles}
+                    onApprove={handleApplyFixes}
+                    onCancel={() => { setShowReview(false); setPreviewFiles([]); }}
+                    loading={applyingFixes}
+                  />
+                ) : loading && !result ? (
                   <div className="flex flex-col items-center justify-center h-full space-y-4 text-muted-foreground">
                     <Terminal className="h-8 w-8 animate-pulse text-green-500" />
                     <p className="text-sm font-mono">{currentPhase || "Initializing..."}</p>

@@ -70,7 +70,7 @@ def detect_project_language(repo_path: str) -> Dict[str, any]:
         project_info["required_sdks"].append("python")
 
         if (repo / "requirements.txt").exists():
-            content = (repo / "requirements.txt").read_text(errors="replace").lower()
+            content = (repo / "requirements.txt").read_text(encoding="utf-8", errors="replace").lower()
             if "django" in content:
                 project_info["frameworks"].append("Django")
             if "flask" in content:
@@ -84,7 +84,7 @@ def detect_project_language(repo_path: str) -> Dict[str, any]:
         project_info["build_tools"].append("Maven")
         project_info["required_sdks"].extend(["java", "maven"])
 
-        pom_content = (repo / "pom.xml").read_text(errors="replace").lower()
+        pom_content = (repo / "pom.xml").read_text(encoding="utf-8", errors="replace").lower()
         if "spring-boot" in pom_content:
             project_info["frameworks"].append("Spring Boot")
         if "spring-security" in pom_content:
@@ -99,7 +99,7 @@ def detect_project_language(repo_path: str) -> Dict[str, any]:
         if not gradle_file.exists():
             gradle_file = repo / "build.gradle.kts"
         if gradle_file.exists():
-            content = gradle_file.read_text(errors="replace").lower()
+            content = gradle_file.read_text(encoding="utf-8", errors="replace").lower()
             if "spring" in content:
                 project_info["frameworks"].append("Spring Boot")
 
@@ -111,7 +111,7 @@ def detect_project_language(repo_path: str) -> Dict[str, any]:
 
         try:
             import json
-            pkg = json.loads((repo / "package.json").read_text())
+            pkg = json.loads((repo / "package.json").read_text(encoding="utf-8", errors="replace"))
             all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
             if "react" in all_deps:
                 project_info["frameworks"].append("React")
@@ -203,121 +203,61 @@ def validate_project(repo_path: str) -> bool:
     elif python_files:
         logger.warning("Python not found on PATH, skipping Python validation")
 
-    # Node.js validation
-    package_json = repo / "package.json"
-    if package_json.exists() and env.get("node") and env.get("npm"):
-        # Only run npm install if package-lock.json exists (quick install)
-        if (repo / "package-lock.json").exists():
-            logger.info("Validating Node.js project (npm ci)...")
-            npm_bin = shutil.which("npm")
-            try:
-                result = subprocess.run(
-                    [npm_bin, "ci", "--ignore-scripts"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=120
-                )
-                if result.returncode != 0:
-                    logger.warning(f"npm ci failed: {result.stderr[:300]}")
-                    # Don't fail — dependencies might need specific Node version
-            except (subprocess.TimeoutExpired, Exception) as e:
-                logger.warning(f"Node.js validation skipped: {e}")
-    elif package_json.exists():
-        logger.warning("Node.js/npm not found on PATH, skipping Node validation")
-
-    # Java/Maven validation — only if Maven AND Java are available
-    pom_xml = repo / "pom.xml"
-    if pom_xml.exists():
-        if env.get("java") and env.get("maven"):
-            logger.info("Validating Java project (Maven compile)...")
-            mvn_bin = shutil.which("mvn")
-
-            # Check if project uses Maven wrapper
-            mvnw = repo / "mvnw"
-            mvnw_cmd = repo / "mvnw.cmd"
-            if mvnw.exists():
-                mvn_bin = str(mvnw)
-            elif mvnw_cmd.exists():
-                mvn_bin = str(mvnw_cmd)
-
-            try:
-                result = subprocess.run(
-                    [mvn_bin, "compile", "-q", "-DskipTests",
-                     "-Dmaven.javadoc.skip=true"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=180
-                )
-                if result.returncode != 0:
-                    logger.warning(
-                        f"Maven compile warning (non-blocking): "
-                        f"{result.stderr[:300]}"
+    # Node.js validation - syntax check only
+    node_files = list(repo.rglob("*.js")) + list(repo.rglob("*.ts"))
+    if node_files and env.get("node"):
+        logger.info(f"Validating {len(node_files)} Node.js files (syntax check)...")
+        node_bin = shutil.which("node")
+        if node_bin:
+            for js_file in node_files:
+                # Skip node_modules
+                if "node_modules" in str(js_file).lower():
+                    continue
+                try:
+                    # Use node --check to validate syntax without executing
+                    result = subprocess.run(
+                        [node_bin, "--check", str(js_file)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
                     )
-                    # Don't fail — Maven projects often need specific JDK
-                    # versions or local dependencies
-            except subprocess.TimeoutExpired:
-                logger.warning("Maven compile timed out (non-blocking)")
-            except FileNotFoundError:
-                logger.warning("Maven binary not found, skipping Java validation")
-            except Exception as e:
-                logger.warning(f"Maven validation skipped: {e}")
-        else:
-            missing = []
-            if not env.get("java"):
-                missing.append("Java JDK")
-            if not env.get("maven"):
-                missing.append("Maven")
-            logger.warning(
-                f"{', '.join(missing)} not found on PATH, "
-                f"skipping Java/Maven validation"
-            )
+                    if result.returncode != 0:
+                        logger.error(
+                            f"Node.js syntax error in {js_file.name}: "
+                            f"{result.stderr[:200]}"
+                        )
+                        return False
+                except subprocess.TimeoutExpired:
+                    continue
 
-    # Gradle validation — only if Gradle AND Java are available
-    build_gradle = repo / "build.gradle"
-    build_gradle_kts = repo / "build.gradle.kts"
-    if build_gradle.exists() or build_gradle_kts.exists():
-        if env.get("java") and env.get("gradle"):
-            logger.info("Validating Java project (Gradle compile)...")
-            gradle_bin = shutil.which("gradle")
-
-            # Check for Gradle wrapper
-            gradlew = repo / "gradlew"
-            gradlew_bat = repo / "gradlew.bat"
-            if gradlew.exists():
-                gradle_bin = str(gradlew)
-            elif gradlew_bat.exists():
-                gradle_bin = str(gradlew_bat)
-
-            try:
-                result = subprocess.run(
-                    [gradle_bin, "compileJava", "-q", "-x", "test"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=180
-                )
-                if result.returncode != 0:
-                    logger.warning(
-                        f"Gradle compile warning (non-blocking): "
-                        f"{result.stderr[:300]}"
+    # Java validation - syntax check only
+    java_files = list(repo.rglob("*.java"))
+    if java_files and env.get("java"):
+        logger.info(f"Validating {len(java_files)} Java files (syntax check)...")
+        javac_bin = shutil.which("javac")
+        if javac_bin:
+            for java_file in java_files:
+                try:
+                    # Use javac with -proc:none to skip annotation processing
+                    # Note: full compilation requires classpath; we only do a best-effort check
+                    result = subprocess.run(
+                        [javac_bin, "-proc:none", str(java_file)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
                     )
-            except subprocess.TimeoutExpired:
-                logger.warning("Gradle compile timed out (non-blocking)")
-            except FileNotFoundError:
-                logger.warning("Gradle binary not found, skipping validation")
-            except Exception as e:
-                logger.warning(f"Gradle validation skipped: {e}")
-        else:
-            missing = []
-            if not env.get("java"):
-                missing.append("Java JDK")
-            if not env.get("gradle"):
-                missing.append("Gradle")
-            logger.warning(
-                f"{', '.join(missing)} not found on PATH, "
-                f"skipping Gradle validation"
-            )
+                    if result.returncode != 0:
+                        # Only fail on clear syntax errors, not missing classpath errors
+                        stderr = result.stderr
+                        if "error:" in stderr and "cannot find symbol" not in stderr and "package" not in stderr:
+                            logger.error(
+                                f"Java syntax error in {java_file.name}: "
+                                f"{stderr[:200]}"
+                            )
+                            return False
+                except subprocess.TimeoutExpired:
+                    continue
+                except Exception:
+                    continue
 
     return True

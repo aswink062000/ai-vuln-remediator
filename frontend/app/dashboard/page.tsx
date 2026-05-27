@@ -27,6 +27,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = `${API_URL}/api/v1`;
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 export default function DashboardPage() {
@@ -55,7 +56,7 @@ export default function DashboardPage() {
 
   const fetchSuppressions = async () => {
     try {
-      const res = await axios.get(`${API_URL}/baseline/suppressions`);
+      const res = await axios.get(`${API_BASE}/baseline/suppressions`);
       setSuppressions(res.data.suppressions || []);
     } catch {
       // Endpoint might not exist yet
@@ -78,7 +79,7 @@ export default function DashboardPage() {
     setMultiLoading(true);
     setMultiResult(null);
     try {
-      const res = await axios.post(`${API_URL}/scan-multi`, { repos: validRepos });
+      const res = await axios.post(`${API_BASE}/scan-multi`, { repos: validRepos });
       setMultiResult(res.data);
     } catch (error: any) {
       setMultiResult({ status: "error", message: error.response?.data?.detail || error.message });
@@ -91,7 +92,7 @@ export default function DashboardPage() {
   const handleSuppress = async () => {
     if (!suppressRule.trim()) return;
     try {
-      await axios.post(`${API_URL}/baseline/suppress`, {
+      await axios.post(`${API_BASE}/baseline/suppress`, {
         rule_id: suppressRule.trim(),
         path: suppressPath.trim(),
         reason: suppressReason,
@@ -106,7 +107,7 @@ export default function DashboardPage() {
 
   const handleUnsuppress = async (ruleId: string) => {
     try {
-      await axios.delete(`${API_URL}/baseline/suppress/${encodeURIComponent(ruleId)}`);
+      await axios.delete(`${API_BASE}/baseline/suppress/${encodeURIComponent(ruleId)}`);
       fetchSuppressions();
     } catch {
       // handle error

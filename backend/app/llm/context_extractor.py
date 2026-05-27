@@ -69,29 +69,35 @@ def extract_relevant_context(
             "token_savings_pct": round((1 - max_context_lines / total_lines) * 100, 1),
         }
 
-    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    # --- IMPLEMENTATION OF CONTEXTUAL SNIPPETS ---
+    # Find the range that covers all affected lines with a 20-line buffer
+    sorted_lines = sorted(list(affected_lines))
+    start_line = max(0, sorted_lines[0] - 21)  # 0-indexed
+    end_line = min(total_lines, sorted_lines[-1] + 20)
 
-    # Extract imports (always include)
+    # Extract imports (always needed for context prepending)
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
     imports = _extract_imports(lines, ext)
 
-    # Extract function/block containing the vulnerability
-    if ext == "py":
-        context_range = _python_function_range(code, affected_lines)
-    else:
-        context_range = _brace_block_range(lines, affected_lines)
+    # If the range is too large, we fall back to the function-aware extraction
+    if (end_line - start_line) > max_context_lines:
+        # Extract function/block containing the vulnerability
+        if ext == "py":
+            context_range = _python_function_range(code, affected_lines)
+        else:
+            context_range = _brace_block_range(lines, affected_lines)
 
-    # Expand context with surrounding lines
-    if context_range:
-        start, end = context_range
-        # Add 5 lines of context above and below
-        start = max(0, start - 5)
-        end = min(total_lines, end + 5)
+        if context_range:
+            start, end = context_range
+            start = max(0, start - 5)
+            end = min(total_lines, end + 5)
+        else:
+            center = sorted(affected_lines)[len(affected_lines) // 2]
+            half = max_context_lines // 2
+            start = max(0, center - half)
+            end = min(total_lines, center + half)
     else:
-        # Fallback: center around affected lines
-        center = sorted(affected_lines)[len(affected_lines) // 2]
-        half = max_context_lines // 2
-        start = max(0, center - half)
-        end = min(total_lines, center + half)
+        start, end = start_line, end_line
 
     # Build context
     context_lines = lines[start:end]

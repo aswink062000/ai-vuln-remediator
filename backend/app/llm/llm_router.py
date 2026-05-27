@@ -41,14 +41,19 @@ class GeminiProvider(LLMProvider):
     def __init__(self, model=None):
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self._client = None
 
     def is_available(self) -> bool:
         return bool(self.api_key)
 
-    def generate(self, prompt: str) -> str:
-        from google import genai
+    def _get_client(self):
+        if self._client is None:
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
 
-        client = genai.Client(api_key=self.api_key)
+    def generate(self, prompt: str) -> str:
+        client = self._get_client()
         response = client.models.generate_content(
             model=self.model,
             contents=prompt,
@@ -64,14 +69,19 @@ class GeminiFlashProvider(LLMProvider):
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.model = "gemini-1.5-flash"
+        self._client = None
 
     def is_available(self) -> bool:
         return bool(self.api_key)
 
-    def generate(self, prompt: str) -> str:
-        from google import genai
+    def _get_client(self):
+        if self._client is None:
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
 
-        client = genai.Client(api_key=self.api_key)
+    def generate(self, prompt: str) -> str:
+        client = self._get_client()
         response = client.models.generate_content(
             model=self.model,
             contents=prompt,
@@ -351,13 +361,14 @@ class LLMRouter:
                         ]
                     )
 
-                    if attempt < max_retries and is_transient:
-                        wait_time = 3 * attempt
-                        logger.info(f"Retrying {provider.name} in {wait_time}s...")
+                    if is_transient and attempt < max_retries:
+                        # Exponential backoff: 2s, 4s, 8s...
+                        wait_time = 2 ** attempt
+                        logger.info(f"Transient error. Retrying in {wait_time}s...")
                         time.sleep(wait_time)
+                        continue
                     else:
-                        # Move to next provider
-                        logger.info(f"Moving to next provider after {provider.name} failure")
+                        # Non-transient error or max retries reached, move to next provider
                         break
 
         # All providers failed

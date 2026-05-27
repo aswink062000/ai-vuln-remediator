@@ -17,6 +17,9 @@ router = APIRouter()
 
 class ScanRequest(BaseModel):
     github_url: str
+    branch: str = ""  # Branch to scan (empty = default branch)
+    pr_branch_name: str = ""  # Custom PR branch name (empty = auto-generated)
+    skill_prompt: str = ""  # Per-scan LLM instructions override
 
 
 class TokenRequest(BaseModel):
@@ -26,6 +29,12 @@ class TokenRequest(BaseModel):
 class TokenTestRequest(BaseModel):
     token: str
     github_url: str = ""
+
+
+class MergeRequest(BaseModel):
+    github_url: str
+    branch_name: str
+    base_branch: str = "main"
 
 
 @router.post("/scan", tags=["Scanning"])
@@ -41,7 +50,102 @@ async def scan_repo(req: ScanRequest):
             detail="Only GitHub HTTPS URLs are supported"
         )
 
-    result = run_remediation(req.github_url)
+    result = run_remediation(
+        req.github_url,
+        branch=req.branch,
+        pr_branch_name=req.pr_branch_name,
+        skill_prompt=req.skill_prompt,
+    )
+    return result
+
+
+@router.post("/scan-fix-preview", tags=["Scanning"])
+async def scan_fix_preview(req: ScanRequest):
+    """
+    Scan and generate AI fixes but DO NOT create a PR.
+    Returns a task_id immediately. Poll GET /progress/{task_id} for real-time updates.
+    Final result is available when status='complete'.
+    """
+    import uuid
+    import threading
+    from app.progress import create_task, update_progress, complete_task, get_progress
+
+    logger.info(f"Received scan-fix-preview request for: {req.github_url}")
+
+    if not req.github_url.startswith("https://github.com/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only GitHub HTTPS URLs are supported"
+        )
+
+    task_id = str(uuid.uuid4())[:8]
+    create_task(task_id)
+
+    def _run_preview():
+        from app.workflow.remediation import run_remediation_preview
+        try:
+            result = run_remediation_preview(
+                req.github_url,
+                branch=req.branch,
+                skill_prompt=req.skill_prompt,
+                progress_callback=lambda phase, msg: update_progress(task_id, phase, msg),
+            )
+            # Store result in progress
+            from app.progress import _progress_store, _lock
+            with _lock:
+                task = _progress_store.get(task_id)
+                if task:
+                    task["result"] = result
+            complete_task(task_id)
+        except Exception as e:
+            update_progress(task_id, "Error", str(e))
+            from app.progress import _progress_store, _lock
+            with _lock:
+                task = _progress_store.get(task_id)
+                if task:
+                    task["result"] = {"status": "error", "message": str(e)}
+            complete_task(task_id, status="error")
+
+    thread = threading.Thread(target=_run_preview, daemon=True)
+    thread.start()
+
+    return {
+        "status": "started",
+        "task_id": task_id,
+        "message": "Scan started. Poll GET /api/v1/progress/{task_id} for updates.",
+    }
+
+
+class ApplyFixesRequest(BaseModel):
+    github_url: str
+    branch: str = ""
+    pr_branch_name: str = ""
+    approved_files: list  # List of {"path": str, "fixed_code": str}
+
+
+@router.post("/apply-fixes", tags=["Scanning"])
+async def apply_fixes(req: ApplyFixesRequest):
+    """
+    Apply only the developer-approved fixes and create a PR.
+    Called after /scan-fix-preview when the developer has reviewed diffs.
+    """
+    from app.workflow.remediation import apply_approved_fixes
+
+    if not req.github_url.startswith("https://github.com/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only GitHub HTTPS URLs are supported"
+        )
+
+    if not req.approved_files:
+        raise HTTPException(status_code=400, detail="No approved files provided")
+
+    result = apply_approved_fixes(
+        req.github_url,
+        approved_files=req.approved_files,
+        branch=req.branch,
+        pr_branch_name=req.pr_branch_name,
+    )
     return result
 
 
@@ -55,11 +159,11 @@ async def scan_only(req: ScanRequest):
     from app.gitops.clone import clone_repo, cleanup_repo
     from app.scanners.multi_scanner import run_all_scanners
 
-    logger.info(f"Received scan-only request for: {req.github_url}")
+    logger.info(f"Received scan-only request for: {req.github_url} (branch={req.branch or 'default'})")
 
     repo_path = None
     try:
-        repo_path = clone_repo(req.github_url)
+        repo_path = clone_repo(req.github_url, branch=req.branch)
 
         # Detect project info
         project_info = detect_project_language(repo_path)
@@ -829,3 +933,158 @@ async def scan_multiple_repos(req: MultiRepoRequest):
         "health_rating": "A" if health_score >= 80 else "B" if health_score >= 60 else "C" if health_score >= 40 else "D" if health_score >= 20 else "F",
         "results": results,
     }
+
+
+@router.post("/merge", tags=["GitOps"])
+async def merge_fix(req: MergeRequest):
+    """
+    Merge a remediation branch into the base branch.
+    Triggered by the 'Merge Fix' button in the UI.
+    """
+    from app.gitops.merge import merge_remediation_branch
+    
+    # Extract repo name from URL
+    # https://github.com/owner/repo -> owner/repo
+    repo_name = req.github_url.replace("https://github.com/", "").rstrip("/")
+    
+    success, message = merge_remediation_branch(repo_name, req.branch_name, req.base_branch)
+    
+    if success:
+        return {"status": "success", "message": message}
+    else:
+        raise HTTPException(status_code=500, detail=message)
+
+
+# =============================================================================
+# SKILLS MANAGEMENT (LLM Prompt)
+# =============================================================================
+
+class SkillRequest(BaseModel):
+    content: str
+
+
+@router.get("/settings/skill", tags=["Settings"])
+async def get_skill():
+    """Get the current LLM skill prompt (vulnerability-remediation.md)."""
+    from app.llm.skill_loader import load_skill, _get_skill_path
+
+    content = load_skill()
+    path = str(_get_skill_path())
+    return {
+        "content": content,
+        "path": path,
+        "exists": bool(content),
+    }
+
+
+@router.post("/settings/skill", tags=["Settings"])
+async def save_skill(req: SkillRequest):
+    """Save/update the LLM skill prompt."""
+    from app.llm.skill_loader import save_skill
+
+    success = save_skill(req.content)
+    if success:
+        return {"status": "saved", "message": "Skill prompt updated successfully."}
+    raise HTTPException(status_code=500, detail="Failed to save skill file.")
+
+
+# =============================================================================
+# BRANCH SUGGESTION
+# =============================================================================
+
+@router.get("/suggest-branch-name", tags=["GitOps"])
+async def suggest_branch_name():
+    """Generate a suggested branch name for the PR."""
+    from app.gitops.branch import generate_branch_name
+    return {"branch_name": generate_branch_name()}
+
+
+# =============================================================================
+# PROGRESS TRACKING
+# =============================================================================
+
+@router.get("/progress/{task_id}", tags=["System"])
+async def get_task_progress(task_id: str):
+    """Get real-time progress for a long-running task (scan-fix-preview, apply-fixes)."""
+    from app.progress import get_progress
+    progress = get_progress(task_id)
+    if not progress:
+        return {"status": "not_found", "task_id": task_id}
+    return progress
+
+
+# =============================================================================
+# BRANCH MANAGEMENT
+# =============================================================================
+
+class BranchListRequest(BaseModel):
+    github_url: str
+
+
+@router.post("/branches", tags=["GitOps"])
+async def list_branches(req: BranchListRequest):
+    """List available branches for a GitHub repository."""
+    import re
+
+    repo_name = req.github_url.replace("https://github.com/", "").rstrip("/").replace(".git", "")
+
+    # Also handle URLs with /tree/branch
+    repo_name = re.sub(r"/tree/.*$", "", repo_name)
+
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=400, detail="GITHUB_TOKEN not configured")
+
+    try:
+        from github import Github
+        g = Github(token)
+        repo = g.get_repo(repo_name)
+        branches = [b.name for b in repo.get_branches()]
+        default_branch = repo.default_branch
+        return {
+            "branches": branches,
+            "default_branch": default_branch,
+            "repo": repo_name,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to list branches: {e}")
+
+
+@router.get("/suggest-branch-name", tags=["GitOps"])
+async def suggest_branch_name():
+    """Generate a suggested branch name for the PR."""
+    from app.gitops.branch import generate_branch_name
+    return {"branch_name": generate_branch_name()}
+
+
+# =============================================================================
+# SKILLS MANAGEMENT (LLM Prompt — per-scan override)
+# =============================================================================
+
+class SkillRequest(BaseModel):
+    content: str
+
+
+@router.get("/settings/skill", tags=["Settings"])
+async def get_skill():
+    """Get the current default LLM skill prompt."""
+    from app.llm.skill_loader import load_skill, _get_skill_path
+
+    content = load_skill()
+    path = str(_get_skill_path())
+    return {
+        "content": content,
+        "path": path,
+        "exists": bool(content),
+    }
+
+
+@router.post("/settings/skill", tags=["Settings"])
+async def save_skill(req: SkillRequest):
+    """Save/update the default LLM skill prompt."""
+    from app.llm.skill_loader import save_skill
+
+    success = save_skill(req.content)
+    if success:
+        return {"status": "saved", "message": "Skill prompt updated successfully."}
+    raise HTTPException(status_code=500, detail="Failed to save skill file.")

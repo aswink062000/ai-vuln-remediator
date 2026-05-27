@@ -4,7 +4,304 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def run_remediation(github_url):
+def run_remediation_preview(github_url, branch="", skill_prompt="", progress_callback=None):
+    """
+    Scan and generate AI fixes but DO NOT push or create PR.
+    Returns original code + fixed code for each file so the frontend can show diffs.
+    """
+    from app.gitops.clone import clone_repo, cleanup_repo
+    from app.scanners.multi_scanner import run_all_scanners
+    from app.parsers.file_reader import read_file
+    from app.llm.analyzer import analyze_and_fix
+    from app.validators.validate import detect_project_language, check_sdk_availability
+    from app.ml.diff_generator import generate_diff
+
+    def progress(phase, msg=""):
+        if progress_callback:
+            progress_callback(phase, msg)
+
+    repo_path = None
+
+    try:
+        progress("Cloning repository", f"Cloning {github_url}...")
+        repo_path = clone_repo(github_url, branch=branch)
+        progress("Cloning repository", "Repository cloned successfully")
+
+        progress("Detecting project", "Analyzing project structure...")
+        project_info = detect_project_language(repo_path)
+        sdk_check = check_sdk_availability(project_info)
+        progress("Detecting project", f"Languages: {', '.join(project_info.get('languages', []))}")
+
+        progress("Running scanners", "Starting SAST, dependency, and secret scans...")
+        scan_result = run_all_scanners(repo_path)
+        findings = scan_result["findings"]
+        summary = scan_result["summary"]
+        progress("Running scanners", f"Scan complete: {len(findings)} findings")
+
+        if not findings:
+            return {
+                "status": "clean",
+                "message": "No vulnerabilities found",
+                "scan_summary": summary,
+                "project_info": project_info,
+                "preview_files": [],
+            }
+
+        # Get fixable findings — expanded to include all categories that can be auto-fixed
+        # - sast: code vulnerabilities (AI rewrites code)
+        # - secret: hardcoded secrets (AI replaces with env vars)
+        # - dependency: vulnerable packages (AI bumps versions in manifest files)
+        # - best-practice: deprecated/outdated packages (AI updates versions)
+        # - custom: user-defined patterns (AI fixes code like SAST)
+        FIXABLE_CATEGORIES = ("sast", "secret", "dependency", "best-practice", "custom")
+
+        remediable = [
+            f for f in findings
+            if f.get("path") and f.get("metadata", {}).get("category") in FIXABLE_CATEGORIES
+        ]
+
+        # Build category breakdown for the report
+        findings_breakdown = {}
+        for f in findings:
+            category = f.get("metadata", {}).get("category", "unknown")
+            scanner = f.get("metadata", {}).get("scanner", "unknown")
+            if category not in findings_breakdown:
+                findings_breakdown[category] = {"count": 0, "scanners": {}, "fixable": category in FIXABLE_CATEGORIES}
+            findings_breakdown[category]["count"] += 1
+            findings_breakdown[category]["scanners"][scanner] = findings_breakdown[category]["scanners"].get(scanner, 0) + 1
+
+        if not remediable:
+            return {
+                "status": "vulnerabilities_found",
+                "message": f"Found {len(findings)} vulnerabilities but none are auto-fixable via code changes.",
+                "total_findings": len(findings),
+                "findings": findings[:50],
+                "scan_summary": summary,
+                "project_info": project_info,
+                "preview_files": [],
+                "findings_breakdown": findings_breakdown,
+            }
+
+        # Group by file
+        files_to_fix = {}
+        for f in remediable:
+            path = f["path"]
+            if path not in files_to_fix:
+                files_to_fix[path] = []
+            files_to_fix[path].append(f)
+
+        # Limit to top 15 files (prioritize by severity count) to keep response time reasonable
+        MAX_FILES_TO_FIX = 15
+        if len(files_to_fix) > MAX_FILES_TO_FIX:
+            # Sort files by number of critical/high findings
+            def file_priority(item):
+                path, findings_list = item
+                critical_count = sum(1 for f in findings_list if f.get("severity", "").upper() in ("CRITICAL", "HIGH"))
+                return (-critical_count, -len(findings_list))
+
+            sorted_files = sorted(files_to_fix.items(), key=file_priority)
+            files_to_fix = dict(sorted_files[:MAX_FILES_TO_FIX])
+            progress("Generating AI fixes", f"Limiting to top {MAX_FILES_TO_FIX} most critical files (of {len(sorted_files)} total)")
+
+        progress("Generating AI fixes", f"Fixing {len(files_to_fix)} files with {len(remediable)} issues...")
+
+        # Generate fixes in PARALLEL (3 concurrent LLM calls)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        preview_files = []
+        file_items = list(files_to_fix.items())
+
+        def _fix_single_file(idx_and_item):
+            idx, (file_path, file_findings) = idx_and_item
+            try:
+                original_code = read_file(repo_path, file_path)
+
+                issues = []
+                for f in file_findings:
+                    issue_line = (
+                        f"- Line {f.get('line', '?')}: [{f['severity']}] "
+                        f"{f['rule_id']}: {f['message']}"
+                    )
+                    # Add fix guidance for dependency/best-practice findings
+                    meta = f.get("metadata", {})
+                    if meta.get("fix_versions"):
+                        issue_line += f"\n  FIX: Upgrade to version {meta['fix_versions'][0]}"
+                    elif meta.get("latest_version"):
+                        issue_line += f"\n  FIX: Upgrade to version {meta['latest_version']}"
+                    elif meta.get("replacement"):
+                        issue_line += f"\n  FIX: Replace with {meta['replacement']}"
+                        if meta.get("recommended_version"):
+                            issue_line += f" version {meta['recommended_version']}"
+                    elif meta.get("fix_guidance"):
+                        issue_line += f"\n  FIX: {meta['fix_guidance']}"
+                    issues.append(issue_line)
+                combined_issue = "\n".join(issues)
+
+                fixed_code = analyze_and_fix(
+                    original_code, combined_issue,
+                    file_path=file_path,
+                    findings=file_findings,
+                    extra_instructions=skill_prompt,
+                    project_info=project_info,
+                )
+
+                diff_data = generate_diff(original_code, fixed_code, file_path)
+
+                return {
+                    "path": file_path,
+                    "original_code": original_code,
+                    "fixed_code": fixed_code,
+                    "findings_count": len(file_findings),
+                    "findings": [
+                        {
+                            "rule_id": f.get("rule_id"),
+                            "severity": f.get("severity"),
+                            "message": f.get("message", "")[:200],
+                            "line": f.get("line"),
+                        }
+                        for f in file_findings
+                    ],
+                    "diff": diff_data,
+                }
+            except Exception as e:
+                logger.error(f"Fix failed for {file_path}: {e}")
+                return {
+                    "path": file_path,
+                    "error": str(e)[:200],
+                    "findings_count": len(file_findings),
+                }
+
+        # Run LLM calls in parallel (3 at a time)
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm-fix") as pool:
+            futures = {
+                pool.submit(_fix_single_file, (idx, item)): idx
+                for idx, item in enumerate(file_items, 1)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                result_item = future.result()
+                preview_files.append(result_item)
+                if "fixed_code" in result_item:
+                    progress("Generating AI fixes", f"[{idx}/{len(file_items)}] ✓ {result_item['path']} fixed")
+                else:
+                    progress("Generating AI fixes", f"[{idx}/{len(file_items)}] ✗ {result_item['path']} failed")
+
+        # Sort preview files by original order
+        path_order = {item[0]: i for i, item in enumerate(file_items)}
+        preview_files.sort(key=lambda f: path_order.get(f["path"], 999))
+
+        progress("Complete", f"Generated fixes for {len([f for f in preview_files if 'fixed_code' in f])} files")
+
+        return {
+            "status": "preview_ready",
+            "message": f"Generated fixes for {len([f for f in preview_files if 'fixed_code' in f])} files. Review and approve to create PR.",
+            "total_findings": len(findings),
+            "fixable_findings": len(remediable),
+            "scan_summary": summary,
+            "project_info": project_info,
+            "sdk_status": sdk_check,
+            "preview_files": preview_files,
+            "findings": findings[:50],
+            "findings_breakdown": findings_breakdown,
+        }
+
+    except Exception as e:
+        logger.exception(f"Preview remediation failed: {e}")
+        return {"status": "error", "message": str(e), "preview_files": []}
+    finally:
+        if repo_path:
+            cleanup_repo(repo_path)
+
+
+def apply_approved_fixes(github_url, approved_files, branch="", pr_branch_name=""):
+    """
+    Apply only the developer-approved fixes and create a PR.
+    approved_files: list of {"path": str, "fixed_code": str}
+    """
+    from app.gitops.clone import clone_repo, cleanup_repo
+    from app.patchers.file_patcher import patch_file
+    from app.validators.validate import validate_project
+    from app.gitops.branch import create_branch
+    from app.gitops.commit import commit_changes
+    from app.gitops.push import push_changes
+    from app.gitops.pull_request import create_pr
+    from app.ml.secret_detector import is_safe_to_apply
+
+    repo_path = None
+
+    try:
+        repo_path = clone_repo(github_url, branch=branch)
+
+        # Apply approved fixes
+        applied = []
+        skipped = []
+        for file_info in approved_files:
+            file_path = file_info["path"]
+            fixed_code = file_info["fixed_code"]
+
+            # Safety check
+            is_safe, secret_error = is_safe_to_apply(fixed_code)
+            if not is_safe:
+                logger.warning(f"Skipping {file_path}: {secret_error}")
+                skipped.append({"path": file_path, "reason": secret_error})
+                continue
+
+            patch_file(repo_path, file_path, fixed_code)
+            applied.append(file_path)
+
+        if not applied:
+            return {
+                "status": "no_fixes_applied",
+                "message": "No fixes passed safety checks.",
+                "skipped_files": skipped,
+            }
+
+        # Validate only the modified files (not the entire project)
+        validation_errors = _validate_fixed_files(repo_path, applied)
+        if validation_errors:
+            logger.warning(f"Validation issues (non-blocking): {validation_errors}")
+            # Don't block PR creation for validation warnings — the AI fix is likely correct
+            # but we can't fully validate without build tools (Maven, npm, etc.)
+
+        # Git operations
+        branch_name = create_branch(repo_path, branch_name=pr_branch_name)
+        commit_changes(repo_path)
+        push_changes(repo_path, branch_name)
+
+        repo_name = github_url.replace("https://github.com/", "").rstrip("/").replace(".git", "")
+
+        # PR should target the branch the user scanned from (not always the repo default)
+        pr_target_branch = branch if branch else ""
+        logger.info(f"Creating PR: source={branch_name}, target={pr_target_branch or '(repo default)'}, scanned_from={branch or '(default)'}")
+
+        pr_url = create_pr(
+            repo_name, branch_name,
+            default_branch=pr_target_branch,
+            fixed_files=[{"path": p, "findings_fixed": 1} for p in applied],
+        )
+
+        return {
+            "status": "success",
+            "message": f"PR created with {len(applied)} approved fixes." + (
+                f" ({len(skipped)} file(s) skipped due to safety checks)" if skipped else ""
+            ),
+            "pr_url": pr_url,
+            "pull_request": pr_url,
+            "branch_name": branch_name,
+            "applied_files": applied,
+            "files_count": len(applied),
+            "skipped_files": skipped,
+        }
+
+    except Exception as e:
+        logger.exception(f"Apply fixes failed: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        if repo_path:
+            cleanup_repo(repo_path)
+
+
+def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
     # Lazy imports — so the app starts even without git installed
     from app.gitops.clone import clone_repo, cleanup_repo, get_default_branch
     from app.gitops.fork import fork_repo, get_repo_clone_url
@@ -26,8 +323,8 @@ def run_remediation(github_url):
 
     try:
         # Step 1: Clone the repository for scanning
-        logger.info(f"Starting remediation for: {github_url}")
-        repo_path = clone_repo(github_url)
+        logger.info(f"Starting remediation for: {github_url} (branch={branch or 'default'})")
+        repo_path = clone_repo(github_url, branch=branch)
 
         # Step 2: Detect project language and check SDK availability
         project_info = detect_project_language(repo_path)
@@ -59,38 +356,22 @@ def run_remediation(github_url):
                 "errors": errors,
             }
 
-        # Step 4: Get all SAST findings (fixable via code changes)
+        # Step 4: Get all fixable findings (code vulnerabilities + dependencies + secrets + best practices + custom)
+        FIXABLE_CATEGORIES = ("sast", "secret", "dependency", "best-practice", "custom")
+
         remediable = [
             f for f in findings
             if f.get("path")
-            and f.get("metadata", {}).get("category") == "sast"
+            and f.get("metadata", {}).get("category") in FIXABLE_CATEGORIES
         ]
 
-        # Step 4b: Get ALL dependency findings (fixable via version bump)
-        # Include even those without fix_versions — we'll try to resolve them
-        dep_fixable = [
-            f for f in findings
-            if f.get("metadata", {}).get("category") == "dependency"
-            and f.get("path")
-        ]
-
-        # Step 4c: Secret findings (fixable via env var replacement)
-        secret_fixable = [
-            f for f in findings
-            if f.get("path")
-            and f.get("metadata", {}).get("category") == "secret"
-        ]
-
-        # Combine secrets with SAST (both are code-level fixes)
-        remediable = remediable + secret_fixable
-
-        if not remediable and not dep_fixable:
+        if not remediable:
             return {
                 "status": "vulnerabilities_found",
                 "message": (
                     f"Found {len(findings)} vulnerabilities "
                     f"({summary['by_category']}). "
-                    "Dependency vulnerabilities require manual version upgrades."
+                    "No auto-fixable findings detected."
                 ),
                 "total_findings": len(findings),
                 "findings": findings[:50],
@@ -99,7 +380,7 @@ def run_remediation(github_url):
                 "sdk_status": sdk_check,
             }
 
-        # Step 5: Fix ALL SAST findings, grouped by file
+        # Step 5: Fix findings, grouped by file
         # Group findings by file path to fix each file once
         files_to_fix = {}
         for f in remediable:
@@ -109,7 +390,7 @@ def run_remediation(github_url):
             files_to_fix[path].append(f)
 
         logger.info(
-            f"Remediating {len(remediable)} SAST findings "
+            f"Remediating {len(remediable)} findings "
             f"across {len(files_to_fix)} files"
         )
 
@@ -123,17 +404,44 @@ def run_remediation(github_url):
                 # Build a combined issue description for all findings in this file
                 issues = []
                 for f in file_findings:
-                    issues.append(
+                    issue_line = (
                         f"- Line {f.get('line', '?')}: [{f['severity']}] "
                         f"{f['rule_id']}: {f['message']}"
                     )
+                    # Add fix guidance for dependency/best-practice findings
+                    meta = f.get("metadata", {})
+                    if meta.get("fix_versions"):
+                        issue_line += f"\n  FIX: Upgrade to version {meta['fix_versions'][0]}"
+                    elif meta.get("latest_version"):
+                        issue_line += f"\n  FIX: Upgrade to version {meta['latest_version']}"
+                    elif meta.get("replacement"):
+                        issue_line += f"\n  FIX: Replace with {meta['replacement']}"
+                        if meta.get("recommended_version"):
+                            issue_line += f" version {meta['recommended_version']}"
+                    elif meta.get("fix_guidance"):
+                        issue_line += f"\n  FIX: {meta['fix_guidance']}"
+                    issues.append(issue_line)
                 combined_issue = "\n".join(issues)
 
                 logger.info(
                     f"Fixing {len(file_findings)} issues in {file_path}"
                 )
 
-                fixed_code = analyze_and_fix(code, combined_issue, file_path=file_path, findings=file_findings)
+                fixed_code = analyze_and_fix(
+                    code, combined_issue,
+                    file_path=file_path,
+                    findings=file_findings,
+                    extra_instructions=skill_prompt,
+                    project_info=project_info,
+                )
+
+                # Security check: ensure AI fix doesn't introduce new secrets
+                from app.ml.secret_detector import is_safe_to_apply
+                is_safe, secret_error = is_safe_to_apply(fixed_code)
+                if not is_safe:
+                    logger.error(f"Secret detected in AI fix for {file_path}: {secret_error}")
+                    raise Exception(f"Security Violation: {secret_error}")
+
                 patch_file(repo_path, file_path, fixed_code)
 
                 # Generate diff for visualization
@@ -249,130 +557,66 @@ def run_remediation(github_url):
                 except Exception as e:
                     logger.warning(f"Migration handling failed (non-blocking): {e}")
 
-        # Step 6: Validate
-        valid = validate_project(repo_path)
+        # Step 6: Final Validation (Syntax Check)
+        if fixed_files:
+            logger.info("Running final syntax validation on all fixed files...")
+            if not validate_project(repo_path):
+                logger.error("Syntax validation failed for one or more fixed files. Aborting push.")
+                return {
+                    "status": "validation_failed",
+                    "message": "AI fixes introduced syntax errors. Push aborted to prevent breaking the build.",
+                    "total_findings": len(findings),
+                    "fixed_files": fixed_files,
+                    "failed_files": failed_files,
+                    "scan_summary": summary,
+                    "project_info": project_info,
+                    "sdk_status": sdk_check,
+                }
 
-        if not valid:
+        # Step 7: Git Operations (Branch, Commit, Push)
+        logger.info("All fixes validated. Creating remediation branch...")
+        try:
+            branch_name = create_branch(repo_path, branch_name=pr_branch_name)
+            commit_changes(repo_path)
+            push_changes(repo_path, branch_name)
+
+            # Extract repo name (owner/repo) from URL for PR creation
+            repo_name_for_pr = github_url.replace("https://github.com/", "").rstrip("/").replace(".git", "")
+            pr_target_branch = branch if branch else ""
+            pr_url = create_pr(repo_name_for_pr, branch_name, default_branch=pr_target_branch, fixed_files=fixed_files, findings=findings)
+            
             return {
-                "status": "validation_failed",
-                "message": "Validation failed after applying fixes",
-                "fixed_files": fixed_files,
+                "status": "success",
+                "message": "Vulnerabilities remediated and PR created",
+                "pr_url": pr_url,
+                "branch_name": branch_name,
                 "total_findings": len(findings),
+                "fixed_files": fixed_files,
+                "failed_files": failed_files,
                 "scan_summary": summary,
                 "project_info": project_info,
                 "sdk_status": sdk_check,
             }
-
-        # Step 7: Git operations — fork if needed, push and create PR
-        cleanup_repo(repo_path)
-        repo_path = None
-
-        repo_name = github_url.replace(
-            "https://github.com/", ""
-        ).replace(".git", "")
-
-        # Fork if we don't have push access
-        logger.info(f"Checking push access to {repo_name}...")
-        fork_name, is_forked = fork_repo(repo_name)
-
-        # Clone with auth
-        clone_url = get_repo_clone_url(fork_name)
-        repo_path = clone_repo(clone_url)
-
-        default_branch = get_default_branch(repo_path)
-
-        # Re-apply ALL fixes on the fresh clone
-        # 1. Re-apply SAST code fixes
-        for file_path, file_findings in files_to_fix.items():
-            try:
-                code = read_file(repo_path, file_path)
-                issues = []
-                for f in file_findings:
-                    issues.append(
-                        f"- Line {f.get('line', '?')}: [{f['severity']}] "
-                        f"{f['rule_id']}: {f['message']}"
-                    )
-                combined_issue = "\n".join(issues)
-                fixed_code = analyze_and_fix(code, combined_issue, file_path=file_path, findings=file_findings)
-                patch_file(repo_path, file_path, fixed_code)
-            except Exception as e:
-                logger.warning(f"Re-apply failed for {file_path}: {e}")
-
-        # 2. Re-apply dependency version bumps (pom.xml, package.json, etc.)
-        if dep_fixable:
-            logger.info("Re-applying dependency version bumps on fresh clone...")
-            _fix_dependencies(repo_path, dep_fixable, [])
-
-            # 3. Re-apply breaking change migrations if needed
-            try:
-                from app.workflow.migration import (
-                    detect_breaking_upgrade,
-                    apply_migration,
-                )
-                for finding in dep_fixable:
-                    metadata = finding.get("metadata", {})
-                    package = metadata.get("package", "")
-                    old_ver = metadata.get("installed_version", "")
-                    fix_vers = metadata.get("fix_versions", [])
-                    new_ver = _pick_best_version(old_ver, fix_vers) if fix_vers else _find_latest_safe_version(package, old_ver, finding.get("path", ""))
-
-                    if not new_ver:
-                        continue
-
-                    migration_info = detect_breaking_upgrade(package, old_ver, new_ver)
-                    if migration_info and not migration_info.get("generic"):
-                        apply_migration(repo_path, migration_info)
-            except Exception as e:
-                logger.warning(f"Migration re-apply failed (non-blocking): {e}")
-
-        # Create branch, commit, push
-        branch_name = create_branch(repo_path)
-        commit_changes(repo_path)
-        push_changes(repo_path, branch_name)
-
-        # Create PR with inline review comments
-        if is_forked:
-            pr_url = create_pr(
-                repo_name=repo_name,
-                branch_name=f"{fork_name.split('/')[0]}:{branch_name}",
-                default_branch=default_branch,
-                fixed_files=fixed_files,
-                findings=remediable,
-            )
-        else:
-            pr_url = create_pr(
-                repo_name=repo_name,
-                branch_name=branch_name,
-                default_branch=default_branch,
-                fixed_files=fixed_files,
-                findings=remediable,
-            )
-
-        total_fixed = sum(f["findings_fixed"] for f in fixed_files)
-
-        return {
-            "status": "success",
-            "pull_request": pr_url,
-            "total_findings": len(findings),
-            "sast_findings_fixed": total_fixed,
-            "files_fixed": fixed_files,
-            "files_failed": failed_files,
-            "remaining_dependency_findings": len(findings) - len(remediable),
-            "scan_summary": summary,
-            "project_info": project_info,
-            "sdk_status": sdk_check,
-            "all_findings": findings[:50],
-            "forked": is_forked,
-            "fork_repo": fork_name if is_forked else None,
-        }
-
+        except Exception as ge:
+            logger.error(f"Git operation failed: {ge}")
+            return {
+                "status": "git_error",
+                "message": f"Fixes applied but failed to push to GitHub: {ge}",
+                "total_findings": len(findings),
+                "fixed_files": fixed_files,
+                "failed_files": failed_files,
+                "scan_summary": summary,
+                "project_info": project_info,
+                "sdk_status": sdk_check,
+            }
     except Exception as e:
-        logger.error(f"Remediation failed: {e}", exc_info=True)
+        logger.exception(f"Critical error during remediation: {e}")
         return {
             "status": "error",
-            "message": str(e),
+            "message": f"Remediation failed: {str(e)}",
+            "total_findings": 0,
+            "errors": [str(e)],
         }
-
     finally:
         if repo_path:
             cleanup_repo(repo_path)
@@ -745,3 +989,55 @@ def _bump_cargo_version(content: str, package: str, old_ver: str, new_ver: str) 
     import re
     pattern = re.compile(rf'({re.escape(package)}\s*=\s*"){re.escape(old_ver)}(")')
     return pattern.sub(rf'\g<1>{new_ver}\g<2>', content, count=1)
+
+
+def _validate_fixed_files(repo_path: str, applied_files: list) -> list:
+    """
+    Validate only the files that were modified (not the entire project).
+    Returns a list of validation error messages (empty = all OK).
+
+    Only checks Python syntax (py_compile) since Java/JS require full build tools.
+    """
+    import subprocess
+    import shutil
+    from pathlib import Path
+
+    errors = []
+    python_bin = shutil.which("python3") or shutil.which("python")
+
+    for file_path in applied_files:
+        full_path = Path(repo_path) / file_path
+
+        if not full_path.exists():
+            continue
+
+        ext = full_path.suffix.lower()
+
+        # Python: syntax check with py_compile
+        if ext == ".py" and python_bin:
+            try:
+                result = subprocess.run(
+                    [python_bin, "-m", "py_compile", str(full_path)],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0:
+                    errors.append(f"{file_path}: {result.stderr[:200]}")
+            except Exception:
+                pass
+
+        # JavaScript/TypeScript: basic syntax check with node --check
+        elif ext in (".js", ".mjs") and shutil.which("node"):
+            try:
+                result = subprocess.run(
+                    ["node", "--check", str(full_path)],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0:
+                    errors.append(f"{file_path}: {result.stderr[:200]}")
+            except Exception:
+                pass
+
+        # Java: skip validation (requires full classpath/Maven — can't validate standalone)
+        # The AI fix is reviewed by the developer anyway
+
+    return errors

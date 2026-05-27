@@ -19,9 +19,15 @@ def extract_findings(scan_result):
     errors = scan_result.get("errors", [])
 
     if errors:
-        logger.warning(f"Semgrep reported {len(errors)} errors during scan")
-        for err in errors[:5]:
-            logger.warning(f"  Scan error: {err}")
+        # Only log actual errors, not parse warnings (PartialParsing is normal for template files)
+        real_errors = [e for e in errors if not (isinstance(e, dict) and e.get("level") in ("warn", "info"))]
+        if real_errors:
+            logger.warning(f"Semgrep reported {len(real_errors)} errors during scan")
+            for err in real_errors[:5]:
+                msg = err.get("message", str(err))[:200] if isinstance(err, dict) else str(err)[:200]
+                logger.warning(f"  Scan error: {msg}")
+        else:
+            logger.debug(f"Semgrep reported {len(errors)} non-critical warnings (PartialParsing, etc.)")
 
     logger.info(f"Processing {len(results)} raw findings from semgrep")
 

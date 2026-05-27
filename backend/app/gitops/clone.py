@@ -168,10 +168,14 @@ def _get_git_repo():
         ) from e
 
 
-def clone_repo(github_url: str) -> str:
+def clone_repo(github_url: str, branch: str = "") -> str:
     """
     Clone a GitHub repository to a local temp directory.
     Returns the path to the cloned repo.
+
+    Args:
+        github_url: The HTTPS URL of the repository.
+        branch: Optional branch to clone. If empty, clones the default branch.
 
     The repo is registered for tracking — guaranteed cleanup on:
     - Normal cleanup_repo() call
@@ -189,13 +193,16 @@ def clone_repo(github_url: str) -> str:
     repo_id = str(uuid.uuid4())
     repo_path = str(Path(BASE_DIR) / repo_id)
 
-    logger.info(f"Cloning {github_url} to {repo_path}")
+    logger.info(f"Cloning {github_url} (branch={branch or 'default'}) to {repo_path}")
 
     # Register BEFORE cloning so it gets cleaned up even if clone partially fails
     _register_repo(repo_path)
 
     try:
-        Repo.clone_from(github_url, repo_path, depth=1)  # Shallow clone for speed
+        clone_kwargs = {"depth": 1}
+        if branch:
+            clone_kwargs["branch"] = branch
+        Repo.clone_from(github_url, repo_path, **clone_kwargs)
         logger.info(f"Successfully cloned to {repo_path}")
 
         # Verify the clone has files
