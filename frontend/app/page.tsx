@@ -1074,6 +1074,51 @@ export default function Home() {
               </div>
             )}
 
+            {/* Build & Test Validation */}
+            {result.validation && result.validation.steps && result.validation.steps.length > 0 && (
+              <div className="px-5 py-4 border-b">
+                <h3 className={`text-xs font-bold uppercase tracking-wider mb-3 border-b-2 pb-1 inline-block ${
+                  result.validation.success
+                    ? "text-green-800 dark:text-green-200 border-green-600"
+                    : "text-orange-800 dark:text-orange-200 border-orange-600"
+                }`}>
+                  Build & Test Validation
+                </h3>
+                <div className="border rounded overflow-hidden text-xs">
+                  {/* Table Header */}
+                  <div className="grid grid-cols-[1fr_auto_1fr] bg-slate-100 dark:bg-slate-800 font-bold text-slate-700 dark:text-slate-300">
+                    <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700">Step</div>
+                    <div className="px-3 py-2 border-r border-slate-200 dark:border-slate-700 text-center w-20">Status</div>
+                    <div className="px-3 py-2">Details</div>
+                  </div>
+                  {result.validation.steps.map((step: any, idx: number) => (
+                    <div key={idx} className={`grid grid-cols-[1fr_auto_1fr] border-t border-slate-200 dark:border-slate-700 ${
+                      idx % 2 === 0 ? "bg-white dark:bg-slate-900" : "bg-slate-50 dark:bg-slate-800/50"
+                    }`}>
+                      <div className="px-3 py-2 font-mono border-r border-slate-200 dark:border-slate-700">{step.name}</div>
+                      <div className="px-3 py-2 text-center w-20 border-r border-slate-200 dark:border-slate-700">
+                        {step.status === "pass" ? (
+                          <span className="text-green-600 font-bold">✓ PASS</span>
+                        ) : step.status === "fail" ? (
+                          <span className="text-red-600 font-bold">✗ FAIL</span>
+                        ) : (
+                          <span className="text-slate-400">— SKIP</span>
+                        )}
+                      </div>
+                      <div className="px-3 py-2 text-muted-foreground truncate" title={step.output}>
+                        {step.status === "fail" ? step.output?.slice(0, 80) : step.status === "skipped" ? step.output?.slice(0, 60) : ""}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {result.validation.success ? (
+                  <p className="text-[11px] text-green-600 dark:text-green-400 mt-2 font-medium">✓ All validation steps passed</p>
+                ) : (
+                  <p className="text-[11px] text-orange-600 dark:text-orange-400 mt-2 font-medium">⚠️ Some steps failed — review PR carefully before merging</p>
+                )}
+              </div>
+            )}
+
             {/* Footer — View PR */}
             <div className="px-5 py-3 bg-slate-50 dark:bg-slate-800/50 flex items-center justify-between">
               <p className="text-[10px] text-muted-foreground">

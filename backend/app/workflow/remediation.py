@@ -256,12 +256,15 @@ def apply_approved_fixes(github_url, approved_files, branch="", pr_branch_name="
                 "skipped_files": skipped,
             }
 
-        # Validate only the modified files (not the entire project)
-        validation_errors = _validate_fixed_files(repo_path, applied)
-        if validation_errors:
-            logger.warning(f"Validation issues (non-blocking): {validation_errors}")
-            # Don't block PR creation for validation warnings — the AI fix is likely correct
-            # but we can't fully validate without build tools (Maven, npm, etc.)
+        # --- Build & Test Validation (before PR creation) ---
+        from app.validators.validate import detect_project_language
+        project_info = detect_project_language(repo_path)
+        build_result = _run_build_and_test(repo_path, project_info)
+
+        if not build_result["success"]:
+            logger.warning(f"Build/test failed: {build_result['error']}")
+            # Don't block entirely — still create PR but include warning
+            # The build failure info will be included in the response
 
         # Git operations
         branch_name = create_branch(repo_path, branch_name=pr_branch_name)
@@ -291,6 +294,7 @@ def apply_approved_fixes(github_url, approved_files, branch="", pr_branch_name="
             "applied_files": applied,
             "files_count": len(applied),
             "skipped_files": skipped,
+            "validation": build_result,
         }
 
     except Exception as e:
@@ -380,10 +384,20 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
                 "sdk_status": sdk_check,
             }
 
+        # Separate dependency findings (version bumps) from code-level findings (LLM fix)
+        dep_fixable = [
+            f for f in remediable
+            if f.get("metadata", {}).get("category") == "dependency"
+        ]
+        code_fixable = [
+            f for f in remediable
+            if f.get("metadata", {}).get("category") != "dependency"
+        ]
+
         # Step 5: Fix findings, grouped by file
         # Group findings by file path to fix each file once
         files_to_fix = {}
-        for f in remediable:
+        for f in code_fixable:
             path = f["path"]
             if path not in files_to_fix:
                 files_to_fix[path] = []
@@ -1041,3 +1055,204 @@ def _validate_fixed_files(repo_path: str, applied_files: list) -> list:
         # The AI fix is reviewed by the developer anyway
 
     return errors
+
+
+def _run_build_and_test(repo_path: str, project_info: dict) -> dict:
+    """
+    Run install, build, and test steps before creating the PR.
+    Returns:
+        {
+            "success": bool,
+            "steps": [{"name": str, "status": "pass"|"fail"|"skipped", "output": str}],
+            "error": str or None,
+        }
+    """
+    import subprocess
+    import shutil
+    from pathlib import Path
+
+    repo = Path(repo_path)
+    languages = project_info.get("languages", [])
+    steps = []
+
+    BUILD_TIMEOUT = 180  # 3 minutes per step
+    TEST_TIMEOUT = 180
+
+    def _run_cmd(cmd: list, cwd: str, timeout: int = BUILD_TIMEOUT) -> tuple:
+        """Run a command and return (success, output)."""
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=False,
+                timeout=timeout,
+            )
+            stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+            output = (stdout + "\n" + stderr).strip()
+            return result.returncode == 0, output[-1000:]  # Last 1000 chars
+        except subprocess.TimeoutExpired:
+            return False, f"Command timed out after {timeout}s"
+        except FileNotFoundError:
+            return False, f"Command not found: {cmd[0]}"
+        except Exception as e:
+            return False, str(e)[:500]
+
+    # ─── Node.js Project ───
+    if "JavaScript/TypeScript" in languages and (repo / "package.json").exists():
+        npm = shutil.which("npm")
+        if not npm:
+            steps.append({"name": "npm install", "status": "skipped", "output": "npm not found on system"})
+        else:
+            # Step 1: Install
+            logger.info("Running npm install...")
+            success, output = _run_cmd([npm, "install", "--legacy-peer-deps"], repo_path, timeout=BUILD_TIMEOUT)
+            steps.append({"name": "npm install", "status": "pass" if success else "fail", "output": output})
+
+            if success:
+                # Step 2: Build (if script exists)
+                try:
+                    import json
+                    pkg = json.loads((repo / "package.json").read_text(encoding="utf-8", errors="replace"))
+                    scripts = pkg.get("scripts", {})
+                except Exception:
+                    scripts = {}
+
+                if "build" in scripts:
+                    logger.info("Running npm run build...")
+                    success, output = _run_cmd([npm, "run", "build"], repo_path, timeout=BUILD_TIMEOUT)
+                    steps.append({"name": "npm run build", "status": "pass" if success else "fail", "output": output})
+                else:
+                    steps.append({"name": "npm run build", "status": "skipped", "output": "No build script in package.json"})
+
+                # Step 3: Test (if script exists)
+                if "test" in scripts:
+                    # Check if test script is just "echo" or placeholder
+                    test_cmd = scripts.get("test", "")
+                    if "echo" in test_cmd.lower() and "error" in test_cmd.lower():
+                        steps.append({"name": "npm test", "status": "skipped", "output": "Test script is a placeholder"})
+                    else:
+                        logger.info("Running npm test...")
+                        success, output = _run_cmd([npm, "test", "--", "--passWithNoTests"], repo_path, timeout=TEST_TIMEOUT)
+                        if not success:
+                            # Retry without extra flags
+                            success, output = _run_cmd([npm, "test"], repo_path, timeout=TEST_TIMEOUT)
+                        steps.append({"name": "npm test", "status": "pass" if success else "fail", "output": output})
+                else:
+                    steps.append({"name": "npm test", "status": "skipped", "output": "No test script in package.json"})
+
+    # ─── Java/Maven Project ───
+    elif "Java" in languages and (repo / "pom.xml").exists():
+        mvn = shutil.which("mvn")
+        mvnw = repo / "mvnw"
+        if mvnw.exists():
+            mvnw.chmod(0o755)
+            mvn = str(mvnw)
+
+        if not mvn:
+            steps.append({"name": "mvn compile", "status": "skipped", "output": "Maven not found on system"})
+        else:
+            # Step 1: Compile
+            logger.info("Running mvn compile...")
+            success, output = _run_cmd([mvn, "compile", "-q", "-DskipTests", "-B"], repo_path, timeout=BUILD_TIMEOUT)
+            steps.append({"name": "mvn compile", "status": "pass" if success else "fail", "output": output})
+
+            if success:
+                # Step 2: Test
+                logger.info("Running mvn test...")
+                success, output = _run_cmd([mvn, "test", "-q", "-B"], repo_path, timeout=TEST_TIMEOUT)
+                steps.append({"name": "mvn test", "status": "pass" if success else "fail", "output": output})
+
+    # ─── Java/Gradle Project ───
+    elif "Java" in languages and ((repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists()):
+        gradle = shutil.which("gradle")
+        gradlew = repo / "gradlew"
+        if gradlew.exists():
+            gradlew.chmod(0o755)
+            gradle = str(gradlew)
+
+        if not gradle:
+            steps.append({"name": "gradle build", "status": "skipped", "output": "Gradle not found on system"})
+        else:
+            # Step 1: Build
+            logger.info("Running gradle build...")
+            success, output = _run_cmd([gradle, "build", "-x", "test", "--no-daemon", "-q"], repo_path, timeout=BUILD_TIMEOUT)
+            steps.append({"name": "gradle build", "status": "pass" if success else "fail", "output": output})
+
+            if success:
+                # Step 2: Test
+                logger.info("Running gradle test...")
+                success, output = _run_cmd([gradle, "test", "--no-daemon", "-q"], repo_path, timeout=TEST_TIMEOUT)
+                steps.append({"name": "gradle test", "status": "pass" if success else "fail", "output": output})
+
+    # ─── Python Project ───
+    elif "Python" in languages:
+        python_bin = shutil.which("python3") or shutil.which("python")
+        pip_bin = shutil.which("pip3") or shutil.which("pip")
+
+        if not python_bin:
+            steps.append({"name": "python check", "status": "skipped", "output": "Python not found on system"})
+        else:
+            # Step 1: Install dependencies (if requirements.txt exists)
+            if (repo / "requirements.txt").exists() and pip_bin:
+                logger.info("Running pip install...")
+                success, output = _run_cmd(
+                    [pip_bin, "install", "-r", "requirements.txt", "--quiet", "--no-warn-script-location"],
+                    repo_path, timeout=BUILD_TIMEOUT
+                )
+                steps.append({"name": "pip install", "status": "pass" if success else "fail", "output": output})
+            else:
+                steps.append({"name": "pip install", "status": "skipped", "output": "No requirements.txt found"})
+
+            # Step 2: Syntax check all modified Python files
+            logger.info("Running Python syntax check...")
+            syntax_ok = True
+            syntax_errors = []
+            for py_file in repo.rglob("*.py"):
+                rel = str(py_file.relative_to(repo))
+                if any(skip in rel for skip in ["venv", ".venv", "node_modules", ".git", "__pycache__"]):
+                    continue
+                try:
+                    result = subprocess.run(
+                        [python_bin, "-m", "py_compile", str(py_file)],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode != 0:
+                        syntax_ok = False
+                        syntax_errors.append(f"{rel}: {result.stderr[:100]}")
+                except Exception:
+                    continue
+            if syntax_errors:
+                steps.append({"name": "python syntax", "status": "fail", "output": "\n".join(syntax_errors[:5])})
+            else:
+                steps.append({"name": "python syntax", "status": "pass", "output": "All files pass syntax check"})
+
+            # Step 3: Run pytest (if available)
+            pytest_bin = shutil.which("pytest")
+            if pytest_bin:
+                logger.info("Running pytest...")
+                success, output = _run_cmd([pytest_bin, "--tb=short", "-q", "--no-header"], repo_path, timeout=TEST_TIMEOUT)
+                steps.append({"name": "pytest", "status": "pass" if success else "fail", "output": output})
+            else:
+                steps.append({"name": "pytest", "status": "skipped", "output": "pytest not installed"})
+
+    # ─── No recognized project type ───
+    else:
+        steps.append({"name": "build", "status": "skipped", "output": "No recognized build system detected"})
+
+    # Determine overall success
+    failed_steps = [s for s in steps if s["status"] == "fail"]
+    overall_success = len(failed_steps) == 0
+
+    if failed_steps:
+        error_msg = "; ".join([f"{s['name']} failed" for s in failed_steps])
+        logger.warning(f"Build/test validation: {error_msg}")
+    else:
+        logger.info(f"Build/test validation: all {len(steps)} steps passed")
+
+    return {
+        "success": overall_success,
+        "steps": steps,
+        "error": "; ".join([f"{s['name']}: {s['output'][:100]}" for s in failed_steps]) if failed_steps else None,
+    }
