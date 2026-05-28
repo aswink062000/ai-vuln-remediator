@@ -39,17 +39,28 @@ class GeminiProvider(LLMProvider):
     name = "gemini"
 
     def __init__(self, model=None):
-        self.api_key = os.getenv("GEMINI_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self._model_override = model
         self._client = None
+        self._last_key = ""
+
+    @property
+    def api_key(self):
+        return os.getenv("GEMINI_API_KEY", "")
+
+    @property
+    def model(self):
+        return self._model_override or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
 
     def _get_client(self):
-        if self._client is None:
+        # Recreate client if key changed
+        current_key = self.api_key
+        if self._client is None or self._last_key != current_key:
             from google import genai
-            self._client = genai.Client(api_key=self.api_key)
+            self._client = genai.Client(api_key=current_key)
+            self._last_key = current_key
         return self._client
 
     def generate(self, prompt: str) -> str:
@@ -67,17 +78,23 @@ class GeminiFlashProvider(LLMProvider):
     name = "gemini-1.5-flash"
 
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.model = "gemini-1.5-flash"
         self._client = None
+        self._last_key = ""
+
+    @property
+    def api_key(self):
+        return os.getenv("GEMINI_API_KEY", "")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
 
     def _get_client(self):
-        if self._client is None:
+        current_key = self.api_key
+        if self._client is None or self._last_key != current_key:
             from google import genai
-            self._client = genai.Client(api_key=self.api_key)
+            self._client = genai.Client(api_key=current_key)
+            self._last_key = current_key
         return self._client
 
     def generate(self, prompt: str) -> str:
@@ -95,9 +112,15 @@ class NvidiaProvider(LLMProvider):
     name = "nvidia"
 
     def __init__(self):
-        self.api_key = os.getenv("NVIDIA_API_KEY", "")
-        self.model = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
         self.base_url = "https://integrate.api.nvidia.com/v1"
+
+    @property
+    def api_key(self):
+        return os.getenv("NVIDIA_API_KEY", "")
+
+    @property
+    def model(self):
+        return os.getenv("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
@@ -130,9 +153,15 @@ class OpenRouterProvider(LLMProvider):
     name = "openrouter"
 
     def __init__(self):
-        self.api_key = os.getenv("OPENROUTER_API_KEY", "")
-        self.model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
         self.base_url = "https://openrouter.ai/api/v1"
+
+    @property
+    def api_key(self):
+        return os.getenv("OPENROUTER_API_KEY", "")
+
+    @property
+    def model(self):
+        return os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
@@ -175,14 +204,17 @@ class HuggingFaceProvider(LLMProvider):
     name = "huggingface"
 
     def __init__(self):
-        self.api_key = os.getenv("HUGGINGFACE_API_KEY", "")
-        self.model = os.getenv(
-            "HUGGINGFACE_MODEL",
-            "Qwen/Qwen2.5-Coder-7B-Instruct"
-        )
+        pass
+
+    @property
+    def api_key(self):
+        return os.getenv("HUGGINGFACE_API_KEY", "")
+
+    @property
+    def model(self):
+        return os.getenv("HUGGINGFACE_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
 
     def is_available(self) -> bool:
-        # Requires a free API key from https://huggingface.co/settings/tokens
         return bool(self.api_key)
 
     def generate(self, prompt: str) -> str:
@@ -218,7 +250,6 @@ class HuggingFaceProvider(LLMProvider):
         )
 
         if response.status_code == 503:
-            # Model is loading — wait and retry
             raise Exception("HuggingFace model loading (503), will retry")
 
         if response.status_code != 200:
@@ -240,9 +271,15 @@ class GroqProvider(LLMProvider):
     name = "groq"
 
     def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY", "")
-        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         self.base_url = "https://api.groq.com/openai/v1"
+
+    @property
+    def api_key(self):
+        return os.getenv("GROQ_API_KEY", "")
+
+    @property
+    def model(self):
+        return os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
@@ -275,6 +312,8 @@ class LLMRouter:
     Tries each provider in priority order until one succeeds.
 
     Supports DEFAULT_LLM_PROVIDER env var to set preferred provider.
+    All providers read API keys dynamically from os.environ so keys saved
+    at runtime take effect immediately without restart.
     """
 
     def __init__(self):
@@ -290,18 +329,16 @@ class LLMRouter:
         # Build provider lookup by name
         self._provider_map = {p.name: p for p in self._all_providers}
 
-        # Reorder based on DEFAULT_LLM_PROVIDER
-        self.providers = self._build_provider_order()
-
-        available = [p.name for p in self.providers if p.is_available()]
+        available = [p.name for p in self._all_providers if p.is_available()]
         logger.info(f"LLM Router initialized. Available providers: {available}")
 
         default = os.getenv("DEFAULT_LLM_PROVIDER", "")
         if default:
             logger.info(f"Default provider set to: {default}")
 
-    def _build_provider_order(self):
-        """Build provider list with default provider first."""
+    @property
+    def providers(self):
+        """Build provider list dynamically with default provider first."""
         default = os.getenv("DEFAULT_LLM_PROVIDER", "").strip().lower()
 
         if not default:
@@ -316,6 +353,16 @@ class LLMRouter:
                 ordered.append(p)
 
         return ordered
+
+    def reload(self):
+        """
+        Reload provider configuration after keys are updated at runtime.
+        Since providers now read keys dynamically from os.environ via properties,
+        this just logs the new state.
+        """
+        available = [p.name for p in self._all_providers if p.is_available()]
+        default = os.getenv("DEFAULT_LLM_PROVIDER", "")
+        logger.info(f"LLM Router reloaded. Available providers: {available}, default: {default or '(auto)'}")
 
     def generate(self, prompt: str, max_retries: int = 2) -> tuple[str, str]:
         """

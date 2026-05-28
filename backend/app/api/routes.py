@@ -438,6 +438,13 @@ async def save_llm_keys(req: LLMKeysRequest):
     if not saved:
         raise HTTPException(status_code=500, detail="Failed to save keys")
 
+    # Reload LLM router so new keys take effect immediately
+    try:
+        from app.llm.llm_router import router as llm_router
+        llm_router.reload()
+    except Exception as e:
+        logger.warning(f"LLM router reload after key save: {e}")
+
     logger.info(f"Saved LLM keys: {saved}")
     return {
         "status": "saved",
