@@ -27,9 +27,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     rm -rf /var/lib/apt/lists/* && \
     node --version && npm --version
 
-# Install Java 17 (required for OpenRewrite, Maven-based projects)
+# Install Java 21 (required for OpenRewrite, Maven-based projects)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-17-jre-headless \
+    openjdk-21-jre-headless \
     maven \
     && rm -rf /var/lib/apt/lists/* && \
     java -version && mvn --version
