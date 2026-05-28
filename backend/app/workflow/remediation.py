@@ -82,10 +82,17 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
                 "findings_breakdown": findings_breakdown,
             }
 
-        # Group by file
+        # Group by file — exclude manifest files from LLM rewriting
+        MANIFEST_FILES = (
+            "package.json", "package-lock.json", "pom.xml", "build.gradle",
+            "build.gradle.kts", "requirements.txt", "Pipfile", "Cargo.toml",
+            "go.mod", "go.sum", "Gemfile", "composer.json", ".csproj",
+        )
         files_to_fix = {}
         for f in remediable:
             path = f["path"]
+            if any(path.endswith(m) for m in MANIFEST_FILES):
+                continue  # Skip manifest files — handled by dependency fixer
             if path not in files_to_fix:
                 files_to_fix[path] = []
             files_to_fix[path].append(f)
@@ -263,8 +270,23 @@ def apply_approved_fixes(github_url, approved_files, branch="", pr_branch_name="
 
         if not build_result["success"]:
             logger.warning(f"Build/test failed: {build_result['error']}")
-            # Don't block entirely — still create PR but include warning
-            # The build failure info will be included in the response
+            # Block push if install/compile step failed (e.g. invalid version) — this means
+            # the fix itself is broken and should not be pushed.
+            install_failed = any(
+                step.get("status") == "fail"
+                and any(kw in step.get("name", "").lower() for kw in ("install", "compile", "mod tidy", "cargo build"))
+                for step in build_result.get("steps", [])
+            )
+            if install_failed:
+                logger.error("Install/compile step failed — aborting push to prevent broken PR.")
+                return {
+                    "status": "build_failed",
+                    "message": f"Fixes failed validation (install error): {build_result.get('error', 'unknown')}. Push aborted.",
+                    "applied_files": applied,
+                    "skipped_files": skipped,
+                    "validation": build_result,
+                }
+            # Non-install failures (test failures, lint warnings) — still create PR with warning
 
         # Git operations
         branch_name = create_branch(repo_path, branch_name=pr_branch_name)
@@ -389,9 +411,18 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
             f for f in remediable
             if f.get("metadata", {}).get("category") == "dependency"
         ]
+        # Exclude manifest/config files from LLM rewriting — these are handled by
+        # _fix_dependencies() and should never be rewritten by the AI to avoid
+        # producing invalid JSON/XML/TOML.
+        MANIFEST_FILES = (
+            "package.json", "package-lock.json", "pom.xml", "build.gradle",
+            "build.gradle.kts", "requirements.txt", "Pipfile", "Cargo.toml",
+            "go.mod", "go.sum", "Gemfile", "composer.json", ".csproj",
+        )
         code_fixable = [
             f for f in remediable
             if f.get("metadata", {}).get("category") != "dependency"
+            and not any(f.get("path", "").endswith(m) for m in MANIFEST_FILES)
         ]
 
         # Step 5: Fix findings, grouped by file
@@ -448,6 +479,28 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
                     extra_instructions=skill_prompt,
                     project_info=project_info,
                 )
+
+                # Structural validation: ensure AI didn't corrupt structured files
+                if file_path.endswith(".json"):
+                    import json as _json
+                    try:
+                        _json.loads(fixed_code)
+                    except _json.JSONDecodeError as je:
+                        logger.warning(
+                            f"AI produced invalid JSON for {file_path}: {je}. "
+                            f"Keeping original file."
+                        )
+                        raise Exception(f"Invalid JSON output: {je}")
+                elif file_path.endswith((".xml", ".pom")):
+                    import xml.etree.ElementTree as _ET
+                    try:
+                        _ET.fromstring(fixed_code)
+                    except _ET.ParseError as xe:
+                        logger.warning(
+                            f"AI produced invalid XML for {file_path}: {xe}. "
+                            f"Keeping original file."
+                        )
+                        raise Exception(f"Invalid XML output: {xe}")
 
                 # Security check: ensure AI fix doesn't introduce new secrets
                 from app.ml.secret_detector import is_safe_to_apply
@@ -546,16 +599,32 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
                             logger.info(f"Breaking upgrade detected: {package} {old_ver}→{new_ver}")
                             logger.info(f"Migration: {migration_info.get('description', '')}")
 
-                            # Apply regex-based migrations (javax→jakarta, etc.)
-                            migration_result = apply_migration(repo_path, migration_info)
-                            logger.info(f"Regex migration: {migration_result['files_migrated']} files, {migration_result['changes']} changes")
-
-                            # Apply LLM-based migrations for complex cases
-                            if migration_info.get("additional_changes"):
-                                llm_result = apply_migration_with_llm(
-                                    repo_path, migration_info, package, old_ver, new_ver
+                            # Try AST-based migration first (routes to the right tool per ecosystem)
+                            ast_handled = False
+                            try:
+                                from app.workflow.ast_transforms import run_ast_migration
+                                ast_result = run_ast_migration(
+                                    repo_path, package, old_ver, new_ver, project_info
                                 )
-                                logger.info(f"LLM migration: {llm_result.get('llm_fixes', 0)} files")
+                                if ast_result.get("success"):
+                                    ast_handled = True
+                                    logger.info(
+                                        f"AST migration successful: {package} via {ast_result.get('method', 'unknown')}"
+                                    )
+                            except Exception as ast_err:
+                                logger.warning(f"AST migration attempt failed: {ast_err}")
+
+                            if not ast_handled:
+                                # Fallback: Apply regex-based migrations (javax→jakarta, etc.)
+                                migration_result = apply_migration(repo_path, migration_info)
+                                logger.info(f"Regex migration: {migration_result['files_migrated']} files, {migration_result['changes']} changes")
+
+                                # Apply LLM-based migrations for complex cases
+                                if migration_info.get("additional_changes"):
+                                    llm_result = apply_migration_with_llm(
+                                        repo_path, migration_info, package, old_ver, new_ver
+                                    )
+                                    logger.info(f"LLM migration: {llm_result.get('llm_fixes', 0)} files")
 
                     # Validate build after all migrations
                     logger.info("Validating build after dependency upgrades...")
@@ -586,6 +655,32 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
                     "project_info": project_info,
                     "sdk_status": sdk_check,
                 }
+
+        # Step 6b: Build/Install Validation (catch invalid versions before pushing)
+        if fixed_files or dep_fixed_count > 0:
+            logger.info("Running build/install validation before push...")
+            build_result = _run_build_and_test(repo_path, project_info)
+            if not build_result["success"]:
+                install_failed = any(
+                    step.get("status") == "fail"
+                    and any(kw in step.get("name", "").lower() for kw in ("install", "compile", "mod tidy", "cargo build"))
+                    for step in build_result.get("steps", [])
+                )
+                if install_failed:
+                    logger.error(f"Install/compile validation failed — aborting push: {build_result.get('error', '')}")
+                    return {
+                        "status": "build_failed",
+                        "message": f"Dependency install failed after fixes: {build_result.get('error', 'unknown')}. Push aborted to prevent broken PR.",
+                        "total_findings": len(findings),
+                        "fixed_files": fixed_files,
+                        "failed_files": failed_files,
+                        "scan_summary": summary,
+                        "project_info": project_info,
+                        "sdk_status": sdk_check,
+                        "validation": build_result,
+                    }
+                else:
+                    logger.warning(f"Build/test warning (non-blocking): {build_result.get('error', '')}")
 
         # Step 7: Git Operations (Branch, Commit, Push)
         logger.info("All fixes validated. Creating remediation branch...")
@@ -642,15 +737,107 @@ def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> 
     Supports: pom.xml, requirements.txt, package.json, build.gradle, .csproj, go.mod, Cargo.toml
 
     Strategy:
-    1. If fix_versions provided → use them directly
-    2. If no fix_versions → try to find latest patch version via API
-    3. If all else fails → bump minor version as best guess
+    1. For Maven/Gradle: Use OpenRewrite for AST-aware version bumps (preferred)
+    2. If OpenRewrite unavailable or fails: fall back to regex-based bumps
+    3. If fix_versions provided → use them directly
+    4. If no fix_versions → try to find latest patch version via API
+    5. Verify version exists before applying
     """
     import re
     from pathlib import Path
 
     fixed_count = 0
     repo = Path(repo_path)
+
+    # ─── Try OpenRewrite first for Maven/Gradle projects ───
+    openrewrite_handled = set()  # Track packages handled by OpenRewrite
+    try:
+        from app.workflow.openrewrite import (
+            is_openrewrite_available,
+            run_openrewrite_dependency_upgrade,
+            run_openrewrite_migration,
+            detect_openrewrite_migration_key,
+        )
+
+        available, build_tool = is_openrewrite_available(repo_path)
+        if available and build_tool in ("maven", "gradle"):
+            logger.info(f"OpenRewrite available ({build_tool}) — using for dependency upgrades")
+
+            for finding in dep_findings:
+                metadata = finding.get("metadata", {})
+                package = metadata.get("package", "")
+                old_version = metadata.get("installed_version", "")
+                fix_versions = metadata.get("fix_versions", [])
+
+                if not package or not old_version:
+                    continue
+
+                # Determine target version
+                if fix_versions:
+                    new_version = _pick_best_version(old_version, fix_versions)
+                else:
+                    file_path = finding.get("path", "")
+                    new_version = _find_latest_safe_version(package, old_version, file_path)
+
+                if not new_version or new_version == old_version:
+                    continue
+
+                # Check if this is a major migration with an OpenRewrite recipe
+                migration_key = detect_openrewrite_migration_key(package, old_version, new_version)
+                if migration_key:
+                    logger.info(f"Detected major migration: {migration_key} — running OpenRewrite recipe")
+                    migration_result = run_openrewrite_migration(repo_path, migration_key)
+                    if migration_result.get("success"):
+                        openrewrite_handled.add(package)
+                        fixed_count += 1
+                        fixed_files.append({
+                            "path": finding.get("path", "pom.xml"),
+                            "findings_fixed": 1,
+                            "confidence": 95,
+                            "diff": {"additions": 1, "deletions": 1, "hunks": 1},
+                            "diff_summary": f"OpenRewrite migration: {migration_key} ({package} {old_version}→{new_version})",
+                            "fix_details": [{
+                                "issue": f"Major upgrade: {package}@{old_version}",
+                                "fixed_by": f"OpenRewrite recipe: {migration_result.get('recipe', migration_key)}",
+                                "cve": finding.get("rule_id", ""),
+                            }],
+                        })
+                        continue
+
+                # Parse groupId:artifactId for Maven/Gradle
+                group_id, artifact_id = _parse_maven_coords(package)
+                if not group_id:
+                    continue  # Not a Maven coordinate, skip OpenRewrite for this one
+
+                # Run OpenRewrite dependency upgrade
+                result = run_openrewrite_dependency_upgrade(
+                    repo_path, group_id, artifact_id, new_version
+                )
+
+                if result.get("success"):
+                    openrewrite_handled.add(package)
+                    fixed_count += 1
+                    fixed_files.append({
+                        "path": finding.get("path", "pom.xml"),
+                        "findings_fixed": 1,
+                        "confidence": 95,
+                        "diff": {"additions": 1, "deletions": 1, "hunks": 1},
+                        "diff_summary": f"OpenRewrite: {package} {old_version}→{new_version}",
+                        "fix_details": [{
+                            "issue": f"Vulnerable: {package}@{old_version}",
+                            "fixed_by": f"Upgraded via OpenRewrite (AST-aware)",
+                            "cve": finding.get("rule_id", ""),
+                        }],
+                    })
+                else:
+                    logger.info(f"OpenRewrite failed for {package}, will try regex fallback")
+
+    except ImportError:
+        logger.warning("OpenRewrite module not available, using regex-based version bumps")
+    except Exception as e:
+        logger.warning(f"OpenRewrite integration error (non-blocking): {e}")
+
+    # ─── Regex-based fallback for packages not handled by OpenRewrite ───
 
     # Group by file
     by_file: dict = {}
@@ -679,6 +866,10 @@ def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> 
                 if not package or not old_version:
                     continue
 
+                # Skip if already handled by OpenRewrite
+                if package in openrewrite_handled:
+                    continue
+
                 # Determine the target version
                 if fix_versions:
                     new_version = _pick_best_version(old_version, fix_versions)
@@ -688,6 +879,21 @@ def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> 
 
                 if not new_version or new_version == old_version:
                     continue
+
+                # Verify the target version actually exists on the registry
+                if not _verify_version_exists(package, new_version, file_path):
+                    logger.warning(
+                        f"Version {new_version} of {package} does not exist on registry. "
+                        f"Falling back to latest available version."
+                    )
+                    # Fallback: query registry for actual latest version
+                    fallback_version = _find_latest_safe_version(package, old_version, file_path)
+                    if fallback_version and fallback_version != old_version and _verify_version_exists(package, fallback_version, file_path):
+                        new_version = fallback_version
+                        logger.info(f"Using verified fallback version: {package}@{new_version}")
+                    else:
+                        logger.warning(f"No valid version found for {package}. Skipping.")
+                        continue
 
                 # Apply version bump based on file type
                 new_content = content
@@ -714,6 +920,18 @@ def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> 
                     logger.info(f"Bumped {package}: {old_version} → {new_version} in {file_path}")
 
             if file_fixed > 0 and content != original:
+                # Validate structured files before writing
+                if file_path.endswith(".json"):
+                    import json as _json
+                    try:
+                        _json.loads(content)
+                    except _json.JSONDecodeError as je:
+                        logger.error(
+                            f"Version bump produced invalid JSON in {file_path}: {je}. "
+                            f"Reverting to original."
+                        )
+                        continue  # Skip this file, don't write broken JSON
+
                 full_path.write_text(content, encoding="utf-8")
                 fixed_count += file_fixed
                 fixed_files.append({
@@ -737,6 +955,23 @@ def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> 
             logger.error(f"Failed to fix dependencies in {file_path}: {e}")
 
     return fixed_count
+
+
+def _parse_maven_coords(package: str) -> tuple:
+    """
+    Parse a package identifier into (groupId, artifactId).
+    Handles formats:
+    - "org.springframework.boot:spring-boot-starter-web" → ("org.springframework.boot", "spring-boot-starter-web")
+    - "org.springframework.boot" → ("org.springframework.boot", "*")
+    - "express" (npm) → ("", "") — not a Maven coordinate
+    """
+    if ":" in package:
+        parts = package.split(":")
+        return parts[0], parts[1] if len(parts) > 1 else "*"
+    # Check if it looks like a Maven groupId (has dots, no slashes, no @)
+    if "." in package and "/" not in package and "@" not in package:
+        return package, "*"
+    return "", ""
 
 
 def _find_latest_safe_version(package: str, current_version: str, file_path: str) -> str:
@@ -796,6 +1031,41 @@ def _query_npm_latest(package: str, major: str) -> str:
             return version
     except Exception:
         pass
+
+
+def _verify_npm_version_exists(package: str, version: str) -> bool:
+    """Check if a specific version exists on npm registry."""
+    import requests
+
+    try:
+        # Strip range prefixes (^, ~, >=) for the check
+        clean_ver = version.lstrip("^~>=<! ")
+        url = f"https://registry.npmjs.org/{package}/{clean_ver}"
+        resp = requests.get(url, timeout=10)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _verify_version_exists(package: str, version: str, file_path: str) -> bool:
+    """Verify a version exists on the appropriate registry based on file type."""
+    import requests
+
+    clean_ver = version.lstrip("^~>=<! ")
+
+    if "package.json" in file_path:
+        return _verify_npm_version_exists(package, clean_ver)
+
+    if "requirements" in file_path.lower() or file_path.endswith(".txt"):
+        try:
+            url = f"https://pypi.org/pypi/{package}/{clean_ver}/json"
+            resp = requests.get(url, timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    # For Maven, Gradle, etc. — skip verification (harder to check, less common issue)
+    return True
 
     return ""
 

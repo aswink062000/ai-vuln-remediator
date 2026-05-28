@@ -64,6 +64,63 @@ const API_BASE = `${API_URL}/api/v1`;
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
+/** Trim a scan result to only keep lightweight metadata for history storage */
+function trimResultForHistory(result: any): any {
+  if (!result) return result;
+  return {
+    status: result.status,
+    message: result.message,
+    total_findings: result.total_findings,
+    fixable_findings: result.fixable_findings,
+    scan_summary: result.scan_summary,
+    project_info: result.project_info,
+    sdk_status: result.sdk_status,
+    // Keep only first 10 findings without heavy metadata
+    findings: (result.findings || []).slice(0, 10).map((f: any) => ({
+      rule_id: f.rule_id,
+      severity: f.severity,
+      message: (f.message || "").slice(0, 150),
+      path: f.path,
+      line: f.line,
+    })),
+    // Strip preview_files (contains full source code) — keep only paths and counts
+    preview_files: (result.preview_files || []).map((f: any) => ({
+      path: f.path,
+      findings_count: f.findings_count,
+      error: f.error,
+    })),
+    // Strip fixed_files code, keep summary
+    fixed_files: (result.fixed_files || []).map((f: any) => ({
+      path: f.path,
+      findings_fixed: f.findings_fixed,
+      confidence: f.confidence,
+    })),
+  };
+}
+
+/** Safely save scan history to sessionStorage with auto-cleanup on quota exceeded */
+function saveHistoryToStorage(history: any[]) {
+  try {
+    sessionStorage.setItem("scanHistory", JSON.stringify(history));
+  } catch (e: any) {
+    if (e?.name === "QuotaExceededError" || e?.code === 22) {
+      // Auto-clean: remove oldest entries until it fits or list is empty
+      let trimmed = [...history];
+      while (trimmed.length > 0) {
+        trimmed.pop(); // remove oldest (last item since newest is first)
+        try {
+          sessionStorage.setItem("scanHistory", JSON.stringify(trimmed));
+          return; // success
+        } catch {
+          // keep trimming
+        }
+      }
+      // If even empty array fails, just clear it
+      sessionStorage.removeItem("scanHistory");
+    }
+  }
+}
+
 export default function Home() {
   const { theme, setTheme } = useTheme();
 
@@ -279,11 +336,11 @@ export default function Home() {
                   url,
                   mode: scanMode,
                   timestamp: new Date().toISOString(),
-                  result: msg.data,
+                  result: trimResultForHistory(msg.data),
                 };
                 setScanHistory((prev) => {
                   const updated = [historyEntry, ...prev].slice(0, 10);
-                  sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+                  saveHistoryToStorage(updated);
                   return updated;
                 });
               }
@@ -382,10 +439,10 @@ export default function Home() {
                   url,
                   mode: scanMode,
                   timestamp: new Date().toISOString(),
-                  result: progress.result,
+                  result: trimResultForHistory(progress.result),
                 };
                 const updated = [historyEntry, ...prev].slice(0, 10);
-                sessionStorage.setItem("scanHistory", JSON.stringify(updated));
+                saveHistoryToStorage(updated);
                 return updated;
               });
             }
@@ -428,11 +485,11 @@ export default function Home() {
         url,
         mode: scanMode,
         timestamp: new Date().toISOString(),
-        result: res.data,
+        result: trimResultForHistory(res.data),
       };
       setScanHistory((prev) => {
         const updatedHistory = [historyEntry, ...prev].slice(0, 10);
-        sessionStorage.setItem("scanHistory", JSON.stringify(updatedHistory));
+        saveHistoryToStorage(updatedHistory);
         return updatedHistory;
       });
     } catch (error: any) {
