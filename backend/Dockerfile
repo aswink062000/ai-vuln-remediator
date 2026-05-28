@@ -16,7 +16,23 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
+    wget \
+    gnupg \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 LTS (required for npm dependency scanning & jscodeshift/ts-morph migrations)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version && npm --version
+
+# Install Java 17 (required for OpenRewrite, Maven-based projects)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    maven \
+    && rm -rf /var/lib/apt/lists/* && \
+    java -version && mvn --version
 
 # Install OpenGrep (SAST scanner)
 RUN curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash || \
