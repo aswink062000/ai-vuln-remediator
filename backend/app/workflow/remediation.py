@@ -197,6 +197,19 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
         path_order = {item[0]: i for i, item in enumerate(file_items)}
         preview_files.sort(key=lambda f: path_order.get(f["path"], 999))
 
+        # ─── Fix dependency vulnerabilities in manifest files (package.json, etc.) ───
+        dep_findings = [
+            f for f in remediable
+            if f.get("metadata", {}).get("category") == "dependency"
+            and f.get("path")
+        ]
+
+        if dep_findings:
+            progress("Fixing dependencies", f"Bumping {len(dep_findings)} vulnerable package versions...")
+            dep_preview_files = _fix_dependencies_preview(repo_path, dep_findings)
+            preview_files.extend(dep_preview_files)
+            progress("Fixing dependencies", f"Fixed {len(dep_preview_files)} manifest file(s)")
+
         progress("Complete", f"Generated fixes for {len([f for f in preview_files if 'fixed_code' in f])} files")
 
         return {
@@ -729,6 +742,137 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
     finally:
         if repo_path:
             cleanup_repo(repo_path)
+
+
+def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
+    """
+    Fix dependency vulnerabilities and return preview data (original + fixed code)
+    for manifest files like package.json, requirements.txt, pom.xml, etc.
+    This is the preview-mode equivalent of _fix_dependencies — it doesn't commit,
+    just returns the diffs for the ReviewPanel.
+    """
+    import re
+    import json as _json
+    from pathlib import Path
+    from app.ml.diff_generator import generate_diff
+
+    repo = Path(repo_path)
+    preview_results = []
+
+    # Group findings by file
+    by_file: dict = {}
+    for f in dep_findings:
+        path = f.get("path", "")
+        if path not in by_file:
+            by_file[path] = []
+        by_file[path].append(f)
+
+    for file_path, file_findings in by_file.items():
+        full_path = repo / file_path
+        if not full_path.exists():
+            continue
+
+        try:
+            original_content = full_path.read_text(encoding="utf-8", errors="replace")
+            content = original_content
+            file_fixed = 0
+
+            for finding in file_findings:
+                metadata = finding.get("metadata", {})
+                package = metadata.get("package", "")
+                old_version = metadata.get("installed_version", "")
+                fix_versions = metadata.get("fix_versions", [])
+
+                if not package or not old_version:
+                    continue
+
+                # Determine the target version
+                if fix_versions:
+                    new_version = _pick_best_version(old_version, fix_versions)
+                else:
+                    new_version = _find_latest_safe_version(package, old_version, file_path)
+
+                if not new_version or new_version == old_version:
+                    continue
+
+                # Verify the target version exists on the registry
+                if not _verify_version_exists(package, new_version, file_path):
+                    fallback_version = _find_latest_safe_version(package, old_version, file_path)
+                    if fallback_version and fallback_version != old_version and _verify_version_exists(package, fallback_version, file_path):
+                        new_version = fallback_version
+                    else:
+                        continue
+
+                # Apply version bump based on file type
+                new_content = content
+                if file_path.endswith("pom.xml"):
+                    new_content = _bump_maven_version(content, package, old_version, new_version)
+                elif file_path.endswith(".txt") and "requirements" in file_path.lower():
+                    new_content = _bump_pip_version(content, package, old_version, new_version)
+                elif file_path == "requirements.txt":
+                    new_content = _bump_pip_version(content, package, old_version, new_version)
+                elif file_path.endswith("package.json"):
+                    new_content = _bump_npm_version(content, package, old_version, new_version)
+                elif file_path.endswith("build.gradle") or file_path.endswith("build.gradle.kts"):
+                    new_content = _bump_gradle_version(content, package, old_version, new_version)
+                elif file_path.endswith(".csproj") or file_path.endswith(".fsproj"):
+                    new_content = _bump_nuget_version(content, package, old_version, new_version)
+                elif file_path.endswith("go.mod"):
+                    new_content = _bump_go_version(content, package, old_version, new_version)
+                elif file_path.endswith("Cargo.toml"):
+                    new_content = _bump_cargo_version(content, package, old_version, new_version)
+
+                if new_content != content:
+                    content = new_content
+                    file_fixed += 1
+                    logger.info(f"[preview] Bumped {package}: {old_version} → {new_version} in {file_path}")
+
+            if file_fixed > 0 and content != original_content:
+                # Validate structured files
+                if file_path.endswith(".json"):
+                    try:
+                        _json.loads(content)
+                    except _json.JSONDecodeError as je:
+                        logger.error(f"[preview] Version bump produced invalid JSON in {file_path}: {je}")
+                        preview_results.append({
+                            "path": file_path,
+                            "error": f"Version bump produced invalid JSON: {je}",
+                            "findings_count": len(file_findings),
+                        })
+                        continue
+
+                # Generate diff for the preview
+                try:
+                    diff_data = generate_diff(original_content, content, file_path)
+                except Exception:
+                    diff_data = {"stats": {"additions": file_fixed, "deletions": file_fixed}, "summary": f"{file_fixed} versions bumped"}
+
+                preview_results.append({
+                    "path": file_path,
+                    "original_code": original_content,
+                    "fixed_code": content,
+                    "findings_count": len(file_findings),
+                    "findings": [
+                        {
+                            "rule_id": f.get("rule_id"),
+                            "severity": f.get("severity"),
+                            "message": f.get("message", "")[:200],
+                            "line": f.get("line"),
+                        }
+                        for f in file_findings
+                    ],
+                    "diff": diff_data,
+                })
+
+        except Exception as e:
+            logger.error(f"[preview] Failed to fix dependencies in {file_path}: {e}")
+            preview_results.append({
+                "path": file_path,
+                "error": str(e)[:200],
+                "findings_count": len(file_findings),
+            })
+
+    return preview_results
 
 
 def _fix_dependencies(repo_path: str, dep_findings: list, fixed_files: list) -> int:
