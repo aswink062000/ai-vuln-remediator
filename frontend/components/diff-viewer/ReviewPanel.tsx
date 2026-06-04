@@ -102,6 +102,12 @@ export function ReviewPanel({ files, onApprove, onCancel, loading }: ReviewPanel
 
   const approvedCount = Object.values(approvals).filter(Boolean).length;
   const fixableCount = files.filter((f) => f.fixed_code && !f.error).length;
+  const totalFindingsApproved = files
+    .filter((f) => approvals[f.path] === true && f.fixed_code && !f.error)
+    .reduce((sum, f) => sum + (f.findings_count || 1), 0);
+  const totalFindingsFixable = files
+    .filter((f) => f.fixed_code && !f.error)
+    .reduce((sum, f) => sum + (f.findings_count || 1), 0);
 
   const severityColor = (severity: string) => {
     const s = severity?.toUpperCase();
@@ -127,7 +133,7 @@ export function ReviewPanel({ files, onApprove, onCancel, loading }: ReviewPanel
           </div>
           <div className="flex items-center gap-2">
             <Badge variant="outline" className="text-xs">
-              {approvedCount}/{fixableCount} approved
+              {approvedCount}/{fixableCount} files · {totalFindingsApproved} findings
             </Badge>
             <Button variant="ghost" size="sm" className="text-xs" onClick={approveAll}>
               Approve All
@@ -209,7 +215,7 @@ export function ReviewPanel({ files, onApprove, onCancel, loading }: ReviewPanel
         {/* Action Buttons */}
         <div className="flex items-center justify-between pt-3 border-t">
           <p className="text-xs text-muted-foreground">
-            {approvedCount} file{approvedCount !== 1 ? "s" : ""} will be included in the PR
+            {approvedCount} file{approvedCount !== 1 ? "s" : ""} ({totalFindingsApproved} findings) will be included in the PR
           </p>
           <div className="flex gap-2">
             <Button variant="outline" onClick={onCancel} disabled={loading}>
@@ -225,7 +231,7 @@ export function ReviewPanel({ files, onApprove, onCancel, loading }: ReviewPanel
               ) : (
                 <GitBranch className="h-4 w-4" />
               )}
-              {loading ? "Creating PR..." : `Create PR (${approvedCount} files)`}
+              {loading ? "Creating PR..." : `Create PR (${totalFindingsApproved} fixes)`}
             </Button>
           </div>
         </div>

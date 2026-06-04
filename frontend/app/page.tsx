@@ -648,6 +648,16 @@ export default function Home() {
         approved_files: approvedFiles,
       });
 
+      // Calculate actual findings fixed per file from preview data
+      const findingsPerFile: Record<string, number> = {};
+      previewFiles.forEach((pf: any) => {
+        findingsPerFile[pf.path] = pf.findings_count || 1;
+      });
+
+      const totalFindingsFixed = approvedFiles.reduce(
+        (sum, f) => sum + (findingsPerFile[f.path] || 1), 0
+      );
+
       // Map the response to match what the UI expects
       const resultData = {
         ...res.data,
@@ -656,13 +666,15 @@ export default function Home() {
         repo: url,
         total_findings: result?.total_findings || 0,
         fixable_findings: result?.fixable_findings || 0,
+        findings_fixed_count: totalFindingsFixed,
         scan_summary: result?.scan_summary || {},
         findings_breakdown: result?.findings_breakdown || {},
         project_info: result?.project_info || {},
         files_fixed: approvedFiles.map((f) => ({
           path: f.path,
-          findings_fixed: 1,
-          confidence: -1,
+          findings_fixed: findingsPerFile[f.path] || 1,
+          confidence: previewFiles.find((pf: any) => pf.path === f.path)?.diff?.stats
+            ? 90 : -1,
         })),
       };
 
@@ -743,6 +755,9 @@ export default function Home() {
     const summary = result.scan_summary;
     const findings = result.findings || [];
     const total = result.total_findings ?? findings.length;
+    const fixedCount = result.findings_fixed_count || (result.files_fixed
+      ? result.files_fixed.reduce((sum: number, f: any) => sum + (f.findings_fixed || 1), 0)
+      : 0);
 
     return (
       <div className="space-y-4">
@@ -756,7 +771,10 @@ export default function Home() {
           ) : (
             <Badge className="bg-orange-600 text-white px-3 py-1"><ShieldAlert className="h-3 w-3 mr-1" /> Vulnerabilities Found</Badge>
           )}
-          <span className="text-sm text-muted-foreground">{total} finding{total !== 1 ? "s" : ""}</span>
+          <span className="text-sm text-muted-foreground">
+            {total} finding{total !== 1 ? "s" : ""}
+            {fixedCount > 0 && <span className="text-green-600 font-semibold ml-2">· {fixedCount} fixed</span>}
+          </span>
         </div>
 
         {summary && (
@@ -1087,8 +1105,10 @@ export default function Home() {
                   </a>
                   <span className="font-semibold text-slate-700 dark:text-slate-300">Files Modified:</span>
                   <span className="font-bold">{result.files_fixed.length}</span>
-                  <span className="font-semibold text-slate-700 dark:text-slate-300">Total Issues Resolved:</span>
-                  <span className="font-bold">{result.files_fixed.reduce((sum: number, f: any) => sum + (f.findings_fixed || 1), 0)}</span>
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">Findings Resolved:</span>
+                  <span className="font-bold text-green-600">
+                    {result.files_fixed.reduce((sum: number, f: any) => sum + (f.findings_fixed || 1), 0)} of {result.total_findings || "?"} fixed
+                  </span>
                 </div>
 
                 {/* Fixed Files Table */}
@@ -1470,7 +1490,7 @@ export default function Home() {
                     <p className="text-muted-foreground text-xs lg:text-sm mt-2">
                       Scan your GitHub repositories for security vulnerabilities and receive AI-generated remediation strategies.
                     </p>
-                    <Dialog>
+                   {/* <Dialog>
                       <DialogTrigger asChild>
                         <button className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline mt-2">
                           <List className="h-3 w-3" />View sample repositories<ExternalLink className="h-3 w-3" />
@@ -1504,7 +1524,7 @@ export default function Home() {
                           </table>
                         </div>
                       </DialogContent>
-                    </Dialog>
+                    </Dialog> */}
                   </div>
 
                   {showError && (

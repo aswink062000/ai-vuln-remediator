@@ -112,7 +112,7 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
 
         progress("Generating AI fixes", f"Fixing {len(files_to_fix)} files with {len(remediable)} issues...")
 
-        # Generate fixes in PARALLEL (3 concurrent LLM calls)
+        # Generate fixes with limited concurrency to avoid LLM rate limits
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         preview_files = []
@@ -144,13 +144,31 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
                     issues.append(issue_line)
                 combined_issue = "\n".join(issues)
 
-                fixed_code = analyze_and_fix(
-                    original_code, combined_issue,
-                    file_path=file_path,
-                    findings=file_findings,
-                    extra_instructions=skill_prompt,
-                    project_info=project_info,
-                )
+                # Retry LLM call up to 2 times with backoff for rate limits
+                import time as _t
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        fixed_code = analyze_and_fix(
+                            original_code, combined_issue,
+                            file_path=file_path,
+                            findings=file_findings,
+                            extra_instructions=skill_prompt,
+                            project_info=project_info,
+                        )
+                        break
+                    except Exception as llm_err:
+                        last_error = llm_err
+                        err_str = str(llm_err)
+                        # Retry on rate limit / transient errors
+                        if attempt < 2 and any(kw in err_str for kw in ("429", "rate_limit", "RESOURCE_EXHAUSTED", "503", "overloaded")):
+                            wait = (attempt + 1) * 5
+                            logger.warning(f"LLM rate limited for {file_path}, retrying in {wait}s (attempt {attempt+1}/3)")
+                            _t.sleep(wait)
+                        else:
+                            raise
+                else:
+                    raise last_error
 
                 diff_data = generate_diff(original_code, fixed_code, file_path)
 
@@ -178,12 +196,18 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
                     "findings_count": len(file_findings),
                 }
 
-        # Run LLM calls in parallel (3 at a time)
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm-fix") as pool:
-            futures = {
-                pool.submit(_fix_single_file, (idx, item)): idx
-                for idx, item in enumerate(file_items, 1)
-            }
+        # Run LLM calls in parallel (2 at a time with delay to avoid rate limits)
+        import time as _time
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-fix") as pool:
+            futures = {}
+            for idx, item in enumerate(file_items, 1):
+                future = pool.submit(_fix_single_file, (idx, item))
+                futures[future] = idx
+                # Small stagger to avoid hitting rate limits on free-tier LLM APIs
+                if idx < len(file_items):
+                    _time.sleep(1.5)
+
             for future in as_completed(futures):
                 idx = futures[future]
                 result_item = future.result()
@@ -212,11 +236,17 @@ def run_remediation_preview(github_url, branch="", skill_prompt="", progress_cal
 
         progress("Complete", f"Generated fixes for {len([f for f in preview_files if 'fixed_code' in f])} files")
 
+        # Calculate actual findings addressed (sum of findings_count from successfully fixed files)
+        findings_addressed = sum(
+            f.get("findings_count", 0) for f in preview_files if "fixed_code" in f and not f.get("error")
+        )
+
         return {
             "status": "preview_ready",
             "message": f"Generated fixes for {len([f for f in preview_files if 'fixed_code' in f])} files. Review and approve to create PR.",
             "total_findings": len(findings),
             "fixable_findings": len(remediable),
+            "findings_addressed": findings_addressed,
             "scan_summary": summary,
             "project_info": project_info,
             "sdk_status": sdk_check,
@@ -754,7 +784,7 @@ def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
     import re
     import json as _json
     from pathlib import Path
-    from app.ml.diff_generator import generate_diff
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     repo = Path(repo_path)
     preview_results = []
@@ -777,33 +807,114 @@ def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
             content = original_content
             file_fixed = 0
 
+            # For package.json: parse the actual versions from the file itself
+            # because npm audit reports "range" (e.g. ">=1.0.0 <2.0.0") not the installed version
+            actual_versions = {}
+            if file_path.endswith("package.json"):
+                try:
+                    pkg_data = _json.loads(original_content)
+                    for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                        for pkg, ver in pkg_data.get(section, {}).items():
+                            # Store the clean version (strip ^, ~, >=, etc.)
+                            actual_versions[pkg] = ver.lstrip("^~>=<! ")
+                except Exception:
+                    pass
+
+            # Deduplicate findings by package name (npm audit can report multiple via entries)
+            seen_packages = set()
+
+            # Batch-fetch latest versions for all packages in parallel to speed things up
+            packages_to_fix = []
             for finding in file_findings:
                 metadata = finding.get("metadata", {})
                 package = metadata.get("package", "")
-                old_version = metadata.get("installed_version", "")
+                if not package or package in seen_packages:
+                    continue
+                seen_packages.add(package)
+
                 fix_versions = metadata.get("fix_versions", [])
+                reported_version = metadata.get("installed_version", "")
 
-                if not package or not old_version:
+                # Use actual version from package.json if available (npm audit reports ranges)
+                old_version = actual_versions.get(package, "")
+                if not old_version:
+                    # Fallback: try to extract a clean semver from the reported version/range
+                    # npm audit ranges look like ">=1.0.0 <2.0.0" or "4.17.1 - 4.17.20"
+                    if reported_version:
+                        semver_match = re.search(r'(\d+\.\d+\.\d+)', reported_version)
+                        old_version = semver_match.group(1) if semver_match else ""
+
+                if not old_version or not re.match(r'^\d+\.\d+', old_version):
                     continue
 
-                # Determine the target version
-                if fix_versions:
-                    new_version = _pick_best_version(old_version, fix_versions)
-                else:
-                    new_version = _find_latest_safe_version(package, old_version, file_path)
-
-                if not new_version or new_version == old_version:
+                # Skip transitive dependencies (not directly in package.json)
+                # because we can't bump them — only direct deps can be version-bumped
+                if file_path.endswith("package.json") and package not in actual_versions:
                     continue
 
-                # Verify the target version exists on the registry
-                if not _verify_version_exists(package, new_version, file_path):
-                    fallback_version = _find_latest_safe_version(package, old_version, file_path)
-                    if fallback_version and fallback_version != old_version and _verify_version_exists(package, fallback_version, file_path):
-                        new_version = fallback_version
+                packages_to_fix.append({
+                    "package": package,
+                    "old_version": old_version,
+                    "fix_versions": fix_versions,
+                    "finding": finding,
+                })
+
+            # Resolve target versions in parallel (network calls to npm registry)
+            def _resolve_version(pkg_info):
+                package = pkg_info["package"]
+                old_version = pkg_info["old_version"]
+                fix_versions = pkg_info["fix_versions"]
+
+                try:
+                    if fix_versions:
+                        new_version = _pick_best_version(old_version, fix_versions)
                     else:
-                        continue
+                        new_version = _find_latest_safe_version(package, old_version, file_path)
 
-                # Apply version bump based on file type
+                    if not new_version or new_version == old_version:
+                        return None
+
+                    # For npm: verify version exists (quick check)
+                    if file_path.endswith("package.json"):
+                        if not _verify_npm_version_exists(package, new_version):
+                            # Version doesn't exist, skip this package
+                            logger.debug(f"[preview] Version {new_version} not found for {package}, skipping")
+                            return None
+
+                    return {
+                        "package": package,
+                        "old_version": old_version,
+                        "new_version": new_version,
+                        "finding": pkg_info["finding"],
+                    }
+                except Exception as e:
+                    logger.warning(f"[preview] Failed to resolve version for {package}: {e}")
+                    return None
+
+            resolved = []
+            if packages_to_fix:
+                # Use thread pool for parallel registry lookups (max 5 concurrent)
+                # Add a global timeout to prevent the entire operation from taking too long
+                from concurrent.futures import TimeoutError as FuturesTimeout
+                with ThreadPoolExecutor(max_workers=5, thread_name_prefix="dep-resolve") as pool:
+                    futures = {pool.submit(_resolve_version, p): p for p in packages_to_fix}
+                    try:
+                        for future in as_completed(futures, timeout=90):
+                            try:
+                                result = future.result(timeout=15)
+                                if result:
+                                    resolved.append(result)
+                            except Exception:
+                                pass  # Skip packages that fail to resolve
+                    except FuturesTimeout:
+                        logger.warning(f"[preview] Dependency resolution timed out after 90s. Resolved {len(resolved)}/{len(packages_to_fix)} packages.")
+
+            # Apply all resolved version bumps
+            for item in resolved:
+                package = item["package"]
+                old_version = item["old_version"]
+                new_version = item["new_version"]
+
                 new_content = content
                 if file_path.endswith("pom.xml"):
                     new_content = _bump_maven_version(content, package, old_version, new_version)
@@ -843,6 +954,7 @@ def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
 
                 # Generate diff for the preview
                 try:
+                    from app.ml.diff_generator import generate_diff
                     diff_data = generate_diff(original_content, content, file_path)
                 except Exception:
                     diff_data = {"stats": {"additions": file_fixed, "deletions": file_fixed}, "summary": f"{file_fixed} versions bumped"}
@@ -851,7 +963,7 @@ def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
                     "path": file_path,
                     "original_code": original_content,
                     "fixed_code": content,
-                    "findings_count": len(file_findings),
+                    "findings_count": file_fixed,
                     "findings": [
                         {
                             "rule_id": f.get("rule_id"),
@@ -859,10 +971,13 @@ def _fix_dependencies_preview(repo_path: str, dep_findings: list) -> list:
                             "message": f.get("message", "")[:200],
                             "line": f.get("line"),
                         }
-                        for f in file_findings
+                        for f in file_findings[:20]  # Limit to avoid huge payloads
                     ],
                     "diff": diff_data,
                 })
+            elif len(packages_to_fix) > 0 and file_fixed == 0:
+                # All packages failed to resolve — don't show as error, just skip
+                logger.warning(f"[preview] Could not resolve any version bumps for {file_path} ({len(packages_to_fix)} packages attempted)")
 
         except Exception as e:
             logger.error(f"[preview] Failed to fix dependencies in {file_path}: {e}")
@@ -1168,13 +1283,14 @@ def _query_npm_latest(package: str, major: str) -> str:
 
     try:
         url = f"https://registry.npmjs.org/{package}/latest"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             version = data.get("version", "")
             return version
     except Exception:
         pass
+    return ""
 
 
 def _verify_npm_version_exists(package: str, version: str) -> bool:
@@ -1185,7 +1301,7 @@ def _verify_npm_version_exists(package: str, version: str) -> bool:
         # Strip range prefixes (^, ~, >=) for the check
         clean_ver = version.lstrip("^~>=<! ")
         url = f"https://registry.npmjs.org/{package}/{clean_ver}"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=5)
         return resp.status_code == 200
     except Exception:
         return False
