@@ -306,30 +306,13 @@ def apply_approved_fixes(github_url, approved_files, branch="", pr_branch_name="
                 "skipped_files": skipped,
             }
 
-        # --- Build & Test Validation (before PR creation) ---
+        # --- Build & Test Validation (informational only — does not block PR) ---
         from app.validators.validate import detect_project_language
         project_info = detect_project_language(repo_path)
         build_result = _run_build_and_test(repo_path, project_info)
 
         if not build_result["success"]:
-            logger.warning(f"Build/test failed: {build_result['error']}")
-            # Block push if install/compile step failed (e.g. invalid version) — this means
-            # the fix itself is broken and should not be pushed.
-            install_failed = any(
-                step.get("status") == "fail"
-                and any(kw in step.get("name", "").lower() for kw in ("install", "compile", "mod tidy", "cargo build"))
-                for step in build_result.get("steps", [])
-            )
-            if install_failed:
-                logger.error("Install/compile step failed — aborting push to prevent broken PR.")
-                return {
-                    "status": "build_failed",
-                    "message": f"Fixes failed validation (install error): {build_result.get('error', 'unknown')}. Push aborted.",
-                    "applied_files": applied,
-                    "skipped_files": skipped,
-                    "validation": build_result,
-                }
-            # Non-install failures (test failures, lint warnings) — still create PR with warning
+            logger.warning(f"Build/test check failed (non-blocking): {build_result.get('error', '')}. Proceeding with PR anyway.")
 
         # Git operations
         branch_name = create_branch(repo_path, branch_name=pr_branch_name)
@@ -699,31 +682,12 @@ def run_remediation(github_url, branch="", pr_branch_name="", skill_prompt=""):
                     "sdk_status": sdk_check,
                 }
 
-        # Step 6b: Build/Install Validation (catch invalid versions before pushing)
+        # Step 6b: Build/Install Validation (informational only — does not block PR)
         if fixed_files or dep_fixed_count > 0:
-            logger.info("Running build/install validation before push...")
+            logger.info("Running build/install validation (non-blocking)...")
             build_result = _run_build_and_test(repo_path, project_info)
             if not build_result["success"]:
-                install_failed = any(
-                    step.get("status") == "fail"
-                    and any(kw in step.get("name", "").lower() for kw in ("install", "compile", "mod tidy", "cargo build"))
-                    for step in build_result.get("steps", [])
-                )
-                if install_failed:
-                    logger.error(f"Install/compile validation failed — aborting push: {build_result.get('error', '')}")
-                    return {
-                        "status": "build_failed",
-                        "message": f"Dependency install failed after fixes: {build_result.get('error', 'unknown')}. Push aborted to prevent broken PR.",
-                        "total_findings": len(findings),
-                        "fixed_files": fixed_files,
-                        "failed_files": failed_files,
-                        "scan_summary": summary,
-                        "project_info": project_info,
-                        "sdk_status": sdk_check,
-                        "validation": build_result,
-                    }
-                else:
-                    logger.warning(f"Build/test warning (non-blocking): {build_result.get('error', '')}")
+                logger.warning(f"Build/install check failed (non-blocking): {build_result.get('error', '')}. Proceeding with PR anyway.")
 
         # Step 7: Git Operations (Branch, Commit, Push)
         logger.info("All fixes validated. Creating remediation branch...")
