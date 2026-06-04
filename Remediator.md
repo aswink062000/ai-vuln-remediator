@@ -1,5 +1,11 @@
 Thank you.
 
+Today, I would like to demonstrate our AI Vulnerability Remediator platform and how it can help accelerate vulnerability remediation across development teams.
+
+Currently, AMEX developers use AI-powered agents integrated within their IDEs to assist with vulnerability analysis and code remediation.
+
+While these tools are helpful for individual developers, the remediation process still requires significant manual effort and lacks centralized governance, visibility, and automation.
+
 Let me walk you through how the AI Vulnerability Remediator works.
 
 ### Screen 1: Repository Selection
